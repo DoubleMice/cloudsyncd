@@ -2,7 +2,7 @@ const express = require('express');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { pipeline } = require('stream');
+const { pipeline, Transform } = require('stream');
 const tar = require('tar');
 
 const app = express();
@@ -251,6 +251,19 @@ function createEncryptStream(key) {
 function streamEncryptedResponse({ res, sourceStream, extraHeaders = {}, label, onComplete }) {
   const { cipher, iv } = createEncryptStream(masterKey);
   let completed = false;
+  const appendAuthTag = new Transform({
+    transform(chunk, encoding, callback) {
+      callback(null, chunk);
+    },
+    flush(callback) {
+      try {
+        this.push(cipher.getAuthTag());
+        callback();
+      } catch (err) {
+        callback(err);
+      }
+    },
+  });
 
   const finish = (err) => {
     if (completed) return;
@@ -267,17 +280,7 @@ function streamEncryptedResponse({ res, sourceStream, extraHeaders = {}, label, 
     res.setHeader(header, value);
   }
 
-  cipher.pipe(res, { end: false });
-
-  res.on('close', () => {
-    if (res.writableEnded) return;
-    const err = new Error('Client disconnected');
-    sourceStream.destroy(err);
-    cipher.destroy(err);
-    finish(err);
-  });
-
-  pipeline(sourceStream, cipher, (err) => {
+  pipeline(sourceStream, cipher, appendAuthTag, res, (err) => {
     if (completed) return;
     if (err) {
       console.error(`[${label}] Stream error:`, err.message);
@@ -290,14 +293,7 @@ function streamEncryptedResponse({ res, sourceStream, extraHeaders = {}, label, 
       return;
     }
 
-    try {
-      const tag = cipher.getAuthTag();
-      res.end(tag, () => finish());
-    } catch (tagErr) {
-      console.error(`[${label}] Finalize error:`, tagErr.message);
-      finish(tagErr);
-      if (!res.destroyed) res.destroy(tagErr);
-    }
+    finish();
   });
 }
 
@@ -548,6 +544,7 @@ app.get(/^\/api\/files\/(.*)/, requireDeviceAuth, (req, res) => {
     sourceStream: fs.createReadStream(filePath),
     label: 'FILE',
     extraHeaders: {
+      'Content-Length': String(fileSize + 16),
       'X-File-Name': encodeURIComponent(path.basename(relPath)),
       'X-File-Size': String(fileSize),
     },

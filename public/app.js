@@ -104,6 +104,37 @@ async function decryptDownloadResponse(res) {
   };
 }
 
+async function getErrorMessage(res, fallback) {
+  try {
+    const contentType = res.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      const body = await res.json();
+      if (body && body.error) return `${fallback}: ${res.status} ${body.error}`;
+    }
+    const text = await res.text();
+    if (text) return `${fallback}: ${res.status} ${text.slice(0, 160)}`;
+  } catch {
+    // Keep the original error path if the response body cannot be parsed.
+  }
+  return `${fallback}: ${res.status}`;
+}
+
+function saveBytes(filename, plainBuf) {
+  const blob = new Blob([plainBuf]);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+
+  setTimeout(() => {
+    URL.revokeObjectURL(url);
+    a.remove();
+  }, 60000);
+}
+
 async function sha256Hex(data) {
   const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data;
   const digest = await window.crypto.subtle.digest('SHA-256', bytes);
@@ -479,16 +510,10 @@ async function downloadFile(name, li) {
     // Encode each path segment separately to preserve slashes
     const encodedPath = name.split('/').map(encodeURIComponent).join('/');
     const res = await apiFetch(`/api/files/${encodedPath}`);
-    if (!res.ok) throw new Error('Download failed');
+    if (!res.ok) throw new Error(await getErrorMessage(res, 'Download failed'));
     const { filename, plainBuf } = await decryptDownloadResponse(res);
 
-    const blob = new Blob([plainBuf]);
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename || name.split('/').pop();
-    a.click();
-    URL.revokeObjectURL(url);
+    saveBytes(filename || name.split('/').pop(), plainBuf);
     toast(`${name.split('/').pop()} 下载完成`, 'ok');
   } catch (err) {
     toast('下载失败: ' + err.message, 'err');
@@ -660,15 +685,9 @@ async function batchDownload() {
     try {
       const encodedPath = fileName.split('/').map(encodeURIComponent).join('/');
       const res = await apiFetch(`/api/files/${encodedPath}`);
-      if (!res.ok) throw new Error('Download failed');
+      if (!res.ok) throw new Error(await getErrorMessage(res, 'Download failed'));
       const { filename, plainBuf } = await decryptDownloadResponse(res);
-      const blob = new Blob([plainBuf]);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename || fileName.split('/').pop();
-      a.click();
-      URL.revokeObjectURL(url);
+      saveBytes(filename || fileName.split('/').pop(), plainBuf);
       downloadedCount++;
     } catch (err) {
       console.error(`Failed to download ${fileName}:`, err);
