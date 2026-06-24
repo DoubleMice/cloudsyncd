@@ -1,8 +1,9 @@
 #!/bin/bash
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORT="${PORT:-21891}"
-TUNNEL_CONFIG="${TUNNEL_CONFIG:-cloudflared-config.yml}"
+TUNNEL_CONFIG="${TUNNEL_CONFIG:-$SCRIPT_DIR/cloudflared-config.yml}"
 
 echo "Starting cloudsyncd on port ${PORT}..."
 
@@ -20,4 +21,5 @@ if [ "${WITH_TUNNEL:-0}" = "1" ]; then
   fi
 fi
 
-node server.js
+cd "$SCRIPT_DIR"
+node "$SCRIPT_DIR/server.js"
