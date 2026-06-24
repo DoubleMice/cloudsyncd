@@ -1,11 +1,45 @@
+# Dependencies
 node_modules/
+
+# Runtime state and secrets
 data/
-.DS_Store
-.claude/
-__pycache__/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime shared payloads
+shared/*
+!shared/.gitkeep
+downloads/
 .syncd_state.json
 .syncd_key
 
-# Runtime shared payloads and local audit artifacts.
-shared/*
-!shared/sync_download.py
+# Cloudflare local credentials/logs
+.cloudflared/
+*.cfargotunnel.com
+cloudflared*.log
+
+# Logs and local reports
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+coverage/
+.nyc_output/
+
+# Python/local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# OS/editor/agent local files
+.DS_Store
+.claude/
+.idea/
+.vscode/

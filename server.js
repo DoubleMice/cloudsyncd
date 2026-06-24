@@ -13,6 +13,16 @@ app.use(express.json({
 }));
 app.use(express.static(path.join(__dirname, 'public')));
 
+// Admin app: a SEPARATE listener bound to loopback only (default :21900).
+// The Cloudflare Tunnel forwards only the client port (PORT = 21891), so
+// /admin and /api/local/* are never reachable via the public hostname —
+// only from this machine (http://127.0.0.1:ADMIN_PORT/admin). For remote
+// admin, SSH port-forward ADMIN_PORT instead of exposing it publicly.
+const adminApp = express();
+adminApp.use(express.json());
+adminApp.use(express.static(path.join(__dirname, 'admin')));
+adminApp.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'admin', 'admin.html')));
+
 const MAX_TEXTS = 100;
 const TEXT_EXPIRY_MS = 24 * 60 * 60 * 1000;
 const MAX_CONCURRENT_DOWNLOADS = 3;
@@ -42,29 +52,49 @@ function saveState(data) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(data, null, 2));
 }
 
-// Master key: generated once, persisted forever
+// Master key + admin token: persisted to state.json so they survive restarts.
+// The master key is rotated only via the admin "rotate-key" action.
 let masterKey = null; // Buffer, 32 bytes
-let devices = [];     // [{ id, pairedAt }]
+let devices = [];      // [{ id, pairedAt }]
+let adminToken = null; // string, 32 hex chars
 
 const saved = loadState();
 if (saved && saved.masterKey) {
   masterKey = Buffer.from(saved.masterKey, 'hex');
   devices = saved.devices || [];
+  adminToken = saved.adminToken || crypto.randomBytes(16).toString('hex');
   console.log(`[STATE] Loaded master key, ${devices.length} paired device(s)`);
 } else {
   masterKey = crypto.randomBytes(32);
   devices = [];
-  saveState({ masterKey: masterKey.toString('hex'), devices });
+  adminToken = crypto.randomBytes(16).toString('hex');
   console.log('[STATE] Generated new master key');
 }
 
-function persistDevices() {
-  saveState({ masterKey: masterKey.toString('hex'), devices });
+function persistState() {
+  saveState({ masterKey: masterKey.toString('hex'), devices, adminToken });
 }
 
-// Admin token: random per-run, written to file for CLI access
+// Persist on boot so any freshly generated admin token is durably stored.
+persistState();
+
+function persistDevices() {
+  persistState();
+}
+
+// Rotate the master key: every paired device's derived auth key becomes invalid,
+// so all devices are dropped and must re-pair. Files on disk stay plaintext
+// (encrypted per request with the current key), so they remain available to
+// re-paired devices. Ephemeral texts (encrypted with the old key) won't decrypt.
+function rotateMasterKey() {
+  masterKey = crypto.randomBytes(32);
+  devices = [];
+  seenRequestNonces.clear();
+  persistState();
+}
+
 const ADMIN_TOKEN_FILE = path.join(DATA_DIR, '.admin-token');
-const adminToken = crypto.randomBytes(16).toString('hex');
+const startedAt = Date.now();
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.writeFileSync(ADMIN_TOKEN_FILE, adminToken, { mode: 0o600 });
 
@@ -101,6 +131,18 @@ function safeEqualHex(left, right) {
     const leftBuf = Buffer.from(left, 'hex');
     const rightBuf = Buffer.from(right, 'hex');
     return leftBuf.length === rightBuf.length && crypto.timingSafeEqual(leftBuf, rightBuf);
+  } catch {
+    return false;
+  }
+}
+
+// Constant-time check for the local admin token (used by the admin UI + CLI).
+function safeEqualAdminToken(token) {
+  if (typeof token !== 'string' || token.length === 0) return false;
+  try {
+    const a = Buffer.from(token);
+    const b = Buffer.from(adminToken);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
   } catch {
     return false;
   }
@@ -342,15 +384,123 @@ app.post('/api/pair/verify', (req, res) => {
   }
 });
 
-// ============ Local-only: Generate new PIN ============
+// ============ Local-only (admin app): Generate new PIN ============
 
-app.post('/api/local/new-pin', (req, res) => {
+adminApp.post('/api/local/new-pin', (req, res) => {
   const token = req.headers['x-admin-token'];
-  if (token !== adminToken) {
+  if (!safeEqualAdminToken(token)) {
     return res.status(403).json({ error: 'Forbidden' });
   }
   const pin = createPairSession();
   res.json({ pin });
+});
+
+// ============ Local-only (admin app): Device Management ============
+
+function revokeDevice(id) {
+  const before = devices.length;
+  devices = devices.filter((entry) => entry.id !== id);
+  if (devices.length !== before) persistDevices();
+  return before - devices.length;
+}
+
+adminApp.get('/api/local/status', (req, res) => {
+  const token = req.headers['x-admin-token'];
+  if (!safeEqualAdminToken(token)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  if (!fs.existsSync(sharedDir)) fs.mkdirSync(sharedDir, { recursive: true });
+  const entries = walkDir(sharedDir);
+  let fileCount = 0;
+  let totalSize = 0;
+  for (const entry of entries) {
+    if (entry.type === 'file') {
+      fileCount++;
+      totalSize += entry.size;
+    }
+  }
+  cleanExpiredTexts();
+  res.json({
+    startedAt,
+    paired: devices.length > 0,
+    deviceCount: devices.length,
+    hasMasterKey: !!masterKey,
+    textsCount: sharedTexts.length,
+    textsMax: MAX_TEXTS,
+    textsExpiryMs: TEXT_EXPIRY_MS,
+    sharedFiles: fileCount,
+    sharedSize: totalSize,
+  });
+});
+
+adminApp.get('/api/local/files', (req, res) => {
+  const token = req.headers['x-admin-token'];
+  if (!safeEqualAdminToken(token)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  if (!fs.existsSync(sharedDir)) fs.mkdirSync(sharedDir, { recursive: true });
+  res.json({ entries: walkDir(sharedDir) });
+});
+
+adminApp.get('/api/local/devices', (req, res) => {
+  const token = req.headers['x-admin-token'];
+  if (!safeEqualAdminToken(token)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  res.json({ devices });
+});
+
+adminApp.post('/api/local/revoke', (req, res) => {
+  const token = req.headers['x-admin-token'];
+  if (!safeEqualAdminToken(token)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  const { deviceId } = req.body || {};
+  if (!deviceId || typeof deviceId !== 'string') {
+    return res.status(400).json({ error: 'Missing deviceId' });
+  }
+  const removed = revokeDevice(deviceId);
+  if (removed === 0) {
+    return res.status(404).json({ error: 'Device not found', devices });
+  }
+  console.log(`[DEVICE] Revoked: ${deviceId} (${devices.length} remaining)`);
+  res.json({ success: true, revoked: deviceId, remaining: devices.length });
+});
+
+adminApp.post('/api/local/revoke-all', (req, res) => {
+  const token = req.headers['x-admin-token'];
+  if (!safeEqualAdminToken(token)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  const count = devices.length;
+  devices = [];
+  persistDevices();
+  console.log(`[DEVICE] Revoked all devices (${count} removed)`);
+  res.json({ success: true, revoked: count, remaining: 0 });
+});
+
+adminApp.post('/api/local/rotate-key', (req, res) => {
+  const token = req.headers['x-admin-token'];
+  if (!safeEqualAdminToken(token)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  const revoked = devices.length;
+  rotateMasterKey();
+  console.log(`[KEY] Master key rotated; ${revoked} device(s) must re-pair`);
+  res.json({ success: true, revoked, message: 'Master key rotated. All devices must re-pair.' });
+});
+
+adminApp.post('/api/local/rotate-token', (req, res) => {
+  const token = req.headers['x-admin-token'];
+  if (!safeEqualAdminToken(token)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  adminToken = crypto.randomBytes(16).toString('hex');
+  persistState();
+  fs.writeFileSync(ADMIN_TOKEN_FILE, adminToken, { mode: 0o600 });
+  console.log('[ADMIN] Admin token rotated');
+  // Return the new token so the admin session can stay logged in.
+  res.json({ success: true, adminToken });
 });
 
 // ============ File Sharing (encrypted) ============
@@ -482,13 +632,26 @@ app.get('/api/texts', requireDeviceAuth, (req, res) => {
 // ============ Start Server ============
 
 const PORT = process.env.PORT || 21891;
-app.listen(PORT, () => {
-  console.log(`cloudsysncd server running on http://localhost:${PORT}`);
+// Client port: bound to loopback by default so it's only reachable via the
+// local Cloudflare Tunnel (or on this machine). Set HOST=0.0.0.0 to expose on LAN.
+const HOST = process.env.HOST || '127.0.0.1';
+app.listen(PORT, HOST, () => {
+  console.log(`cloudsyncd client  on http://${HOST}:${PORT}  (tunnel-facing)`);
   console.log(`Shared directory: ${sharedDir}`);
   console.log(`Paired devices: ${devices.length}`);
   if (devices.length === 0) {
     createPairSession();
   } else {
-    console.log('\nReady. Run `node pin.js` to generate a PIN for a new device.\n');
+    console.log('\nReady. Run `node pin.js` to generate a PIN for a new device.');
+    console.log('Run `node devices.js` to list or revoke paired devices.\n');
   }
+});
+
+// Admin port: loopback only, NOT forwarded by the tunnel. Manage at
+// http://127.0.0.1:ADMIN_PORT/admin. Override ADMIN_HOST only if you know
+// exactly what network you're exposing the admin surface to.
+const ADMIN_PORT = process.env.ADMIN_PORT || 21900;
+const ADMIN_HOST = process.env.ADMIN_HOST || '127.0.0.1';
+adminApp.listen(ADMIN_PORT, ADMIN_HOST, () => {
+  console.log(`cloudsyncd admin   on http://${ADMIN_HOST}:${ADMIN_PORT}/admin  (local only)`);
 });

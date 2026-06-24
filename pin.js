@@ -2,7 +2,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const PORT = process.env.PORT || 21891;
+const ADMIN_PORT = process.env.ADMIN_PORT || 21900;
 const tokenFile = path.join(__dirname, 'data', '.admin-token');
 
 let token;
@@ -13,7 +13,7 @@ try {
   process.exit(1);
 }
 
-fetch(`http://127.0.0.1:${PORT}/api/local/new-pin`, {
+fetch(`http://127.0.0.1:${ADMIN_PORT}/api/local/new-pin`, {
   method: 'POST',
   headers: { 'x-admin-token': token },
 })
