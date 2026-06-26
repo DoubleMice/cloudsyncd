@@ -420,7 +420,7 @@ function renderNextPage() {
     const indent = Math.min(depth, 3);
     const baseName = entry.name.split('/').pop();
     const li = document.createElement('li');
-    const checkboxId = 'file-' + btoa(entry.name).replace(/=+$/, '');
+    const checkboxId = `file-${i}`;
 
     if (entry.type === 'dir') {
       li.className = `file-item dir-item indent-${indent}`;
