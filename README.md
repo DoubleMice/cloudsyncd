@@ -6,6 +6,8 @@
 
 架构图和关键协议流程见 [docs/architecture.md](./docs/architecture.md)。
 
+![cloudsyncd client pairing screen](./docs/client_web.png)
+
 ## 架构图
 
 ### 运行拓扑
