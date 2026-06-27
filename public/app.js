@@ -432,7 +432,7 @@ function renderNextPage() {
       li.dataset.name = entry.name;
       // Add checkbox for selection mode
       li.innerHTML = `<input type="checkbox" class="file-checkbox" id="${checkboxId}">
-        <label for="${checkboxId}" class="file-checkbox-label" onclick="event.stopPropagation();">
+        <label for="${checkboxId}" class="file-checkbox-label">
           <svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg>
         </label>
         <div class="file-content-wrapper">
@@ -705,6 +705,11 @@ async function batchDownload() {
 }
 
 function setupEventListeners() {
+  // Refresh files button (was an inline onclick; moved here so CSP script-src
+  // 'self' can be enforced without 'unsafe-inline').
+  const refreshBtn = document.getElementById('refresh-files-btn');
+  if (refreshBtn) refreshBtn.addEventListener('click', loadFiles);
+
   // Toggle selection mode button
   if (toggleSelectionModeBtn) {
     toggleSelectionModeBtn.addEventListener('click', toggleSelectionMode);
@@ -739,6 +744,14 @@ function setupEventListeners() {
 
   // Setup checkbox click handlers for file items
   document.getElementById('file-list')?.addEventListener('click', (e) => {
+    // Label clicks only stop propagation (was an inline onclick); the checkbox
+    // toggle is handled by the .file-checkbox branch below via the label's
+    // default behavior. Kept here for CSP (no inline handler).
+    if (e.target.closest('.file-checkbox-label')) {
+      e.stopPropagation();
+      return;
+    }
+
     const checkbox = e.target.closest('.file-checkbox');
     if (checkbox) {
       const li = checkbox.closest('.file-item');

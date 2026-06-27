@@ -1,3 +1,7 @@
+// Secure-by-default: hide Express development error pages (stack traces) unless
+// explicitly overridden (e.g. NODE_ENV=development for local development).
+process.env.NODE_ENV = process.env.NODE_ENV || 'production';
+
 const express = require('express');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -6,11 +10,13 @@ const { pipeline, Transform } = require('stream');
 const tar = require('tar');
 
 const app = express();
+app.disable('x-powered-by');
 app.use(express.json({
   verify: (req, res, buf) => {
     req.rawBody = Buffer.from(buf);
   },
 }));
+app.use(securityHeaders);
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Admin app: a SEPARATE listener bound to loopback only (default :21900).
@@ -35,6 +41,64 @@ const seenRequestNonces = new Map();
 const DATA_DIR = path.join(__dirname, 'data');
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
 const sharedDir = path.join(__dirname, 'shared');
+
+// ============ Security Middleware ============
+
+// Security headers for the tunnel-facing client app. HSTS is intentionally not
+// set here: the origin speaks plain HTTP on loopback; HTTPS (and therefore
+// HSTS) is terminated by the Cloudflare Tunnel in front of it — set HSTS there.
+function securityHeaders(req, res, next) {
+  res.setHeader('Content-Security-Policy', [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com",
+    "img-src 'self' data: blob:",
+    "connect-src 'self'",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+  ].join('; '));
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+  next();
+}
+
+// Minimal in-memory per-IP rate limiter for the unauthenticated pairing
+// endpoints (the only unauthenticated routes on the tunnel-facing port). Keyed
+// by CF-Connecting-IP (set by the Cloudflare Tunnel) with a socket-IP fallback.
+// Caps PIN brute-force / pairing-session-burn DoS from a single source; a legit
+// operator pairing from a different IP is unaffected.
+const PAIR_RATE_WINDOW_MS = 60_000;
+const PAIR_RATE_MAX = 10;
+const pairRateBuckets = new Map();
+function pairRateLimit(req, res, next) {
+  const ip = req.headers['cf-connecting-ip'] || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  let bucket = pairRateBuckets.get(ip);
+  if (!bucket || bucket.resetAt < now) {
+    bucket = { count: 0, resetAt: now + PAIR_RATE_WINDOW_MS };
+    pairRateBuckets.set(ip, bucket);
+  }
+  bucket.count++;
+  if (bucket.count > PAIR_RATE_MAX) {
+    res.setHeader('Retry-After', String(Math.ceil((bucket.resetAt - now) / 1000)));
+    return res.status(429).json({ error: 'Too many requests' });
+  }
+  if (pairRateBuckets.size > 4096) {
+    for (const [k, v] of pairRateBuckets) if (v.resetAt < now) pairRateBuckets.delete(k);
+  }
+  next();
+}
+
+// Uniform 401 for every request-auth failure — prevents a deviceId-existence
+// oracle (differential 401 bodies) on the public endpoints.
+function authFail(res) {
+  return res.status(401).json({ error: 'Invalid request authentication' });
+}
 
 // ============ Persistent State ============
 
@@ -197,36 +261,40 @@ function requireDeviceAuth(req, res, next) {
   const nonce = req.headers['x-auth-nonce'];
   const signature = req.headers['x-auth-signature'];
   if (!deviceId || !timestamp || !nonce || !signature) {
-    return res.status(401).json({ error: 'Missing request authentication headers' });
-  }
-
-  const device = devices.find((entry) => entry.id === deviceId);
-  if (!device) {
-    return res.status(401).json({ error: 'Unknown device' });
+    return authFail(res);
   }
 
   const timestampMs = Number(timestamp);
   if (!Number.isFinite(timestampMs)) {
-    return res.status(401).json({ error: 'Invalid request timestamp' });
+    return authFail(res);
   }
 
   const now = Date.now();
   if (Math.abs(now - timestampMs) > REQUEST_AUTH_WINDOW_MS) {
-    return res.status(401).json({ error: 'Request timestamp expired' });
+    return authFail(res);
   }
 
-  pruneSeenNonces(now);
-  if (hasSeenNonce(deviceId, nonce)) {
-    return res.status(409).json({ error: 'Replay detected' });
-  }
-
+  // Look up the device, but derive an auth key and run the constant-time
+  // signature check on the same code path for known AND unknown deviceIds, so
+  // an unknown deviceId yields the same 401 as a bad signature — no
+  // deviceId-existence oracle via differential responses. An unknown device can
+  // never authenticate.
+  const device = devices.find((entry) => entry.id === deviceId);
   const bodyHash = sha256Hex(req.rawBody || Buffer.alloc(0));
   const expectedSignature = hmac(
     deriveRequestAuthKey(deviceId),
     buildRequestSignatureMessage(req.method, req.originalUrl, String(timestamp), String(nonce), bodyHash)
   );
-  if (!safeEqualHex(expectedSignature, signature)) {
-    return res.status(401).json({ error: 'Invalid request signature' });
+  const signatureOk = safeEqualHex(expectedSignature, signature) && !!device;
+  if (!signatureOk) {
+    return authFail(res);
+  }
+
+  pruneSeenNonces(now);
+  // A replayed (already-seen) nonce returns the same 401 as any other failure —
+  // do not reveal that the signature was otherwise valid.
+  if (hasSeenNonce(deviceId, nonce)) {
+    return authFail(res);
   }
 
   rememberNonce(deviceId, nonce, now);
@@ -322,14 +390,14 @@ app.get('/api/status', (req, res) => {
   res.json({ paired: devices.length > 0 });
 });
 
-app.get('/api/pair/init', (req, res) => {
+app.get('/api/pair/init', pairRateLimit, (req, res) => {
   if (!pendingPair) {
     return res.status(400).json({ error: 'No active pairing session. Generate a new PIN on the server.' });
   }
   res.json({ serverPublicKey: pendingPair.keyPair.publicKey });
 });
 
-app.post('/api/pair/verify', (req, res) => {
+app.post('/api/pair/verify', pairRateLimit, (req, res) => {
   if (!pendingPair) {
     return res.status(400).json({ error: 'No active pairing session' });
   }
@@ -338,21 +406,36 @@ app.post('/api/pair/verify', (req, res) => {
     return res.status(403).json({ error: 'Too many attempts. Generate a new PIN.' });
   }
 
-  const { clientPublicKey, proof, deviceId } = req.body;
+  const { clientPublicKey, proof, deviceId } = req.body || {};
   if (!clientPublicKey || !proof) {
     return res.status(400).json({ error: 'Missing fields' });
   }
 
-  pendingPair.attempts++;
-
   try {
-    const sharedSecret = pendingPair.keyPair.ecdh.computeSecret(Buffer.from(clientPublicKey, 'hex'));
-    const authKey = Buffer.from(hkdf(sharedSecret, 'syncd-auth', 'pin-verify', 32));
+    // Validate the client public key before the ECDH op and BEFORE burning an
+    // attempt: a P-256 uncompressed public key is 65 bytes (0x04 + 32 + 32).
+    // Malformed keys are rejected with 400 without counting as a PIN guess, so
+    // an attacker cannot cheaply burn the 5-attempt budget with garbage.
+    const pubBuf = Buffer.from(clientPublicKey, 'hex');
+    if (pubBuf.length !== 65 || pubBuf[0] !== 0x04) {
+      return res.status(400).json({ error: 'Invalid client public key' });
+    }
 
-    if (proof !== hmac(authKey, pendingPair.pin)) {
+    const sharedSecret = pendingPair.keyPair.ecdh.computeSecret(pubBuf);
+    const authKey = Buffer.from(hkdf(sharedSecret, 'syncd-auth', 'pin-verify', 32));
+    const expectedProof = hmac(authKey, pendingPair.pin);
+
+    // Constant-time compare (consistent with the request-auth and admin-token
+    // paths). Only a real PIN mismatch counts as an attempt.
+    if (!safeEqualHex(expectedProof, proof)) {
+      pendingPair.attempts++;
       const remaining = pendingPair.maxAttempts - pendingPair.attempts;
       console.log(`[PAIR] Invalid PIN attempt (${remaining} remaining)`);
-      return res.status(401).json({ error: 'Invalid PIN', remaining });
+      if (pendingPair.attempts >= pendingPair.maxAttempts) {
+        pendingPair = null;
+        return res.status(403).json({ error: 'Too many attempts. Generate a new PIN.' });
+      }
+      return res.status(401).json({ error: 'Invalid PIN' });
     }
 
     // PIN verified — encrypt master key with transport key and send to client
@@ -376,7 +459,10 @@ app.post('/api/pair/verify', (req, res) => {
     res.json({ success: true, serverProof, encryptedMasterKey });
   } catch (err) {
     console.error('[PAIR] Error:', err.message);
-    res.status(500).json({ error: 'Key exchange failed' });
+    // computeSecret throws on an off-curve/invalid point despite the 0x04
+    // length check — treat as a bad client key (400), not a server error, and
+    // do NOT burn an attempt or leak internal details.
+    res.status(400).json({ error: 'Invalid client public key' });
   }
 });
 
@@ -528,12 +614,33 @@ app.get('/api/files', requireDeviceAuth, (req, res) => {
 app.get(/^\/api\/files\/(.*)/, requireDeviceAuth, (req, res) => {
   const relPath = req.params[0] || '';
   const filePath = path.resolve(path.join(sharedDir, relPath));
-  if (!filePath.startsWith(path.resolve(sharedDir))) return res.status(403).json({ error: 'Access denied' });
-  if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) return res.status(404).json({ error: 'Not found' });
-  
-  const stat = fs.statSync(filePath);
+
+  // Containment with real symlink resolution. path.resolve is purely lexical
+  // (it does not follow symlinks), so a string startsWith() guard can be
+  // bypassed by a shared* sibling directory or by a symlink placed inside
+  // shared/. Resolve the real path and require it to stay strictly under the
+  // real shared/ root.
+  let realFile;
+  try {
+    realFile = fs.realpathSync(filePath);
+  } catch {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  const realShared = fs.realpathSync(sharedDir);
+  const rel = path.relative(realShared, realFile);
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+    return res.status(403).json({ error: 'Access denied' });
+  }
+  let stat;
+  try {
+    stat = fs.statSync(realFile);
+  } catch {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  if (!stat.isFile()) return res.status(404).json({ error: 'Not found' });
+
   const fileSize = stat.size;
-  
+
   if (activeDownloads >= MAX_CONCURRENT_DOWNLOADS) {
     return res.status(503).json({ error: 'Too many concurrent downloads. Please try again later.' });
   }
@@ -541,7 +648,7 @@ app.get(/^\/api\/files\/(.*)/, requireDeviceAuth, (req, res) => {
   activeDownloads++;
   streamEncryptedResponse({
     res,
-    sourceStream: fs.createReadStream(filePath),
+    sourceStream: fs.createReadStream(realFile),
     label: 'FILE',
     extraHeaders: {
       'Content-Length': String(fileSize + 16),
@@ -624,6 +731,17 @@ app.post('/api/text', requireDeviceAuth, (req, res) => {
 app.get('/api/texts', requireDeviceAuth, (req, res) => {
   cleanExpiredTexts();
   res.json({ texts: sharedTexts });
+});
+
+// Catch-all error handler: never leak stack traces to clients, regardless of
+// env. Catches body-parser SyntaxError (400) on malformed JSON and any thrown
+// error on the public surface, returning only generic messages.
+app.use((err, req, res, next) => {
+  const status = (err && (err.status || err.statusCode)) || 500;
+  console.error(`[ERROR] ${req.method} ${req.originalUrl}:`, err && err.message);
+  res.status(status >= 400 && status < 600 ? status : 500).json({
+    error: status === 400 ? 'Bad request' : 'Internal error',
+  });
 });
 
 // ============ Start Server ============
