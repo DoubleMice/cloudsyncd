@@ -1,5 +1,7 @@
 # cloudsyncd
 
+原始仓库: https://github.com/toads/cloudsysncd
+
 一个轻量的 Node.js 文件 / 文本同步服务。服务端生成一次性 PIN，浏览器客户端通过 ECDH + HKDF 协商主密钥；配对后的受保护请求使用 `deviceId + timestamp + nonce + HMAC` 做逐请求鉴权，文件与文本内容在传输时加密。
 
 当前仓库按私人部署维护。默认服务只绑定本机回环地址，适合通过 Cloudflare Tunnel 或 SSH 端口转发访问，不建议把 Node 服务端口直接暴露到公网。
