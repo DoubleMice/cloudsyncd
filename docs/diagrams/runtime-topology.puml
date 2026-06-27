@@ -1,0 +1,51 @@
+@startuml
+!theme plain
+left to right direction
+
+title cloudsyncd runtime topology
+
+actor "Browser client" as Browser
+actor "Local operator" as Operator
+cloud "Cloudflare Edge\nsync.example.com" as Edge
+
+node "Host machine" as Host {
+  component "cloudflared\nnamed tunnel: sync" as Tunnel
+
+  node "Node process\nserver.js" as Node {
+    component "client Express app\n127.0.0.1:21891" as ClientApp
+    component "admin Express app\n127.0.0.1:21900" as AdminApp
+  }
+
+  folder "public/" as PublicDir
+  folder "admin/" as AdminDir
+  folder "shared/" as SharedDir
+  database "data/state.json\nmasterKey, devices,\nadminToken" as State
+  artifact "data/.admin-token" as TokenFile
+}
+
+Browser --> Edge : HTTPS UI and API
+Edge --> Tunnel : Cloudflare Tunnel
+Tunnel --> ClientApp : HTTP loopback\n/api/* and static UI
+
+ClientApp --> PublicDir : serves index.html and app.js
+ClientApp --> SharedDir : list files and stream downloads
+ClientApp --> State : masterKey and device list
+
+Operator --> AdminApp : local browser or SSH port forward
+AdminApp --> AdminDir : serves admin UI
+AdminApp --> State : device/key/token operations
+AdminApp --> SharedDir : status and file listing
+AdminApp --> TokenFile : local token copy
+
+note bottom of AdminApp
+  The tunnel forwards only 21891.
+  /admin and /api/local/* stay local-only.
+end note
+
+note bottom of ClientApp
+  Public routes use security headers,
+  per-request HMAC, timestamp window,
+  and nonce replay protection.
+end note
+
+@enduml

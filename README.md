@@ -4,6 +4,8 @@
 
 当前仓库按私人部署维护。默认服务只绑定本机回环地址，适合通过 Cloudflare Tunnel 或 SSH 端口转发访问，不建议把 Node 服务端口直接暴露到公网。
 
+架构图和关键协议流程见 [docs/architecture.md](./docs/architecture.md)。
+
 ## 功能
 
 - 浏览器端 PIN 配对
@@ -19,6 +21,7 @@
 - `server.js`: Express 服务端，同时启动客户端端口和本地管理端口
 - `public/`: 浏览器客户端页面
 - `admin/`: 本地管理面板
+- `docs/architecture.md`: 运行拓扑和配对 / 下载流程图
 - `pin.js`: 通过本地管理端口生成新 PIN
 - `devices.js`: 设备列表、撤销、主密钥轮换、管理 Token 轮换
 - `share.js`: 把文件或目录加入 `shared/`，默认使用硬链接，失败时回退复制

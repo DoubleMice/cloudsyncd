@@ -1,0 +1,40 @@
+@startuml
+!theme plain
+
+title cloudsyncd pairing and protected download
+
+actor "Browser user" as User
+participant "Browser client\npublic/app.js" as Client
+participant "Client API\nserver.js:21891" as API
+database "data/state.json" as State
+participant "shared/" as Shared
+
+== PIN pairing ==
+User -> Client : Enter 6-digit PIN
+Client -> API : GET /api/pair/init
+API --> Client : serverPublicKey
+Client -> Client : Generate P-256 ECDH key pair\nHKDF(syncd-auth)\nHMAC(PIN)
+Client -> API : POST /api/pair/verify\nclientPublicKey, proof, deviceId
+API -> API : rate limit\nvalidate public key\ncompute shared secret
+API -> State : store or update device
+API --> Client : serverProof,\nencryptedMasterKey
+Client -> Client : verify serverProof\nHKDF(syncd-transport)\ndecrypt masterKey\nsave IndexedDB
+
+== File list ==
+Client -> Client : derive request-auth key\nHMAC(method,path,timestamp,nonce,bodyHash)
+Client -> API : GET /api/files\nX-Device-Id + HMAC headers
+API -> API : timestamp window\nnonce replay check\nsignature check
+API -> Shared : walkDir()
+API --> Client : AES-GCM encrypted file tree
+Client -> Client : decrypt and render list
+
+== File download ==
+Client -> Client : encode path segments\nsign request
+Client -> API : GET /api/files/{path}\nX-Device-Id + HMAC headers
+API -> API : auth check\nrealpath containment check
+API -> Shared : fs.createReadStream(realFile)
+API -> API : file -> AES-GCM cipher\nappend auth tag via pipeline
+API --> Client : encrypted stream\nX-Encrypted-IV + tag length
+Client -> Client : decrypt stream payload\nsave Blob download
+
+@enduml
