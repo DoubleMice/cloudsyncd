@@ -35,7 +35,8 @@
 - `pin.js`: 通过本地管理端口生成新 PIN
 - `devices.js`: 设备列表、撤销、主密钥轮换、管理 Token 轮换
 - `share.js`: 把文件或目录加入 `shared/`，默认使用硬链接，失败时回退复制
-- `cloudflared-config.yml`: 当前私有部署的 Cloudflare Tunnel 配置
+- `cloudflared-config.example.yml`: Cloudflare Tunnel 配置模板
+- `cloudflared-config.yml`: 本地私有 Tunnel 配置，默认忽略，不提交
 - `data/`: 运行时状态，保存主密钥、已配对设备和管理 Token，必须保持忽略
 - `shared/`: 运行时共享载荷目录，必须保持忽略
 
@@ -124,7 +125,16 @@ ssh -L 21900:127.0.0.1:21900 user@server
 
 ## Cloudflare Tunnel
 
-当前私有部署配置在 `cloudflared-config.yml` 中，命名隧道 `sync` 将 `https://sync.example.com` 转发到本机 `127.0.0.1:21891`。凭证文件位于 `~/.cloudflared/`，不在仓库中。
+仓库只保留 `cloudflared-config.example.yml` 模板。真实的 `cloudflared-config.yml` 包含 tunnel ID、hostname 和凭证文件路径，默认被 `.gitignore` 忽略，不应提交。
+
+首次配置：
+
+```bash
+cp cloudflared-config.example.yml cloudflared-config.yml
+# 编辑 cloudflared-config.yml，填入自己的 tunnel、credentials-file 和 hostname
+```
+
+目标拓扑是将你的公网 hostname 转发到本机 `127.0.0.1:21891`。
 
 日常启动：
 
@@ -135,10 +145,10 @@ WITH_TUNNEL=1 ./start.sh
 或服务已运行时单独启动隧道：
 
 ```bash
-cloudflared tunnel --config cloudflared-config.yml run sync
+cloudflared tunnel --config cloudflared-config.yml run <tunnel-name>
 ```
 
-迁移到其他机器或域名时，需要重新创建 Cloudflare Tunnel，并更新 `tunnel`、`credentials-file` 和 `hostname`。
+迁移到其他机器或域名时，需要重新创建 Cloudflare Tunnel，并只更新本地 `cloudflared-config.yml`。
 
 没有固定域名时，可以临时使用：
 

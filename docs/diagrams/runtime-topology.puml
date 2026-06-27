@@ -6,7 +6,7 @@ title cloudsyncd runtime topology
 
 actor "Browser client" as Browser
 actor "Local operator" as Operator
-cloud "Cloudflare Edge\nsync.example.com" as Edge
+cloud "Cloudflare Edge\nyour sync hostname" as Edge
 
 node "Host machine" as Host {
   component "cloudflared\nnamed tunnel: sync" as Tunnel

@@ -1,0 +1,17 @@
+# Cloudflare Tunnel config template for cloudsyncd.
+# Copy this file to cloudflared-config.yml and fill in your own deployment
+# values. cloudflared-config.yml is ignored by Git because it contains
+# deployment-specific identifiers and credential paths.
+#
+# Run with:
+#   cloudflared tunnel --config cloudflared-config.yml run <tunnel-name>
+
+tunnel: <your-tunnel-id-or-name>
+credentials-file: /path/to/.cloudflared/<your-tunnel-id>.json
+
+ingress:
+  # Route your hostname to the local cloudsyncd client service.
+  - hostname: sync.example.com
+    service: http://127.0.0.1:21891
+  # Catch-all: anything else gets a 404 rather than reaching the service.
+  - service: http_status:404

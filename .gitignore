@@ -20,6 +20,8 @@ downloads/
 
 # Cloudflare local credentials/logs
 .cloudflared/
+cloudflared-config.yml
+cloudflared-config.local.yml
 *.cfargotunnel.com
 cloudflared*.log
 

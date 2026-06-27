@@ -9,7 +9,7 @@
 对应源码：
 
 - `start.sh`: 从仓库目录启动 `server.js`，可选拉起 `cloudflared tunnel --config ... run sync`
-- `cloudflared-config.yml`: 将 `sync.example.com` 转发到 `http://127.0.0.1:21891`
+- `cloudflared-config.example.yml`: 展示将公网 hostname 转发到 `http://127.0.0.1:21891` 的模板
 - `server.js`: 同一 Node 进程中启动两个 Express app
 - `public/`: 公网客户端 UI，只经客户端端口访问
 - `admin/`: 本地管理 UI，只经管理端口访问
@@ -20,7 +20,7 @@
 
 - 客户端端口默认绑定 `127.0.0.1:21891`，面向 Cloudflare Tunnel。
 - 管理端口默认绑定 `127.0.0.1:21900`，不在 tunnel ingress 规则中。
-- 公网域名只应到达客户端 Express app；`/admin`、`/admin.js`、`/api/local/*` 不应通过公网命中管理端。
+- 公网 hostname 只应到达客户端 Express app；`/admin`、`/admin.js`、`/api/local/*` 不应通过公网命中管理端。
 - HSTS 不在 Node origin 上设置；origin 是本机 HTTP，公网 HTTPS 由 Cloudflare 边缘终止。
 
 ## 配对和下载流程
