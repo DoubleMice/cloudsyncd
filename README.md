@@ -6,6 +6,16 @@
 
 架构图和关键协议流程见 [docs/architecture.md](./docs/architecture.md)。
 
+## 架构图
+
+### 运行拓扑
+
+![cloudsyncd runtime topology](./docs/diagrams/runtime-topology.png)
+
+### 配对和下载流程
+
+![cloudsyncd pairing and protected download](./docs/diagrams/pairing-download-sequence.png)
+
 ## 功能
 
 - 浏览器端 PIN 配对
