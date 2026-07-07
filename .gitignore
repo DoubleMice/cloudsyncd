@@ -10,10 +10,13 @@ data/
 *.key
 *.p12
 *.pfx
+*.pid
+*.pid.lock
+client-profiles.json
+.cloudsyncd/
 
 # Runtime shared payloads
 shared/*
-!shared/.gitkeep
 downloads/
 .syncd_state.json
 .syncd_key
@@ -22,6 +25,8 @@ downloads/
 .cloudflared/
 cloudflared-config.yml
 cloudflared-config.local.yml
+cloudflared-credentials*.json
+/????????-????-????-????-????????????.json
 *.cfargotunnel.com
 cloudflared*.log
 

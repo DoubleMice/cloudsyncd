@@ -11,6 +11,20 @@
     "dev": "NODE_ENV=development nodemon --watch server.js --watch public server.js",
     "test": "node --test"
   },
+  "files": [
+    "admin/",
+    "bin/",
+    "cloudflared-config.example.yml",
+    "devices.js",
+    "docs/",
+    "lib/",
+    "pin.js",
+    "public/",
+    "server.js",
+    "share.js",
+    "start.sh",
+    "OPEN_SOURCE_AUDIT.md"
+  ],
   "keywords": [],
   "author": "",
   "license": "ISC",

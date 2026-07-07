@@ -34,19 +34,27 @@
 - 本地管理面板（Admin UI）
 - 可选 Cloudflare Tunnel 部署
 
-## 目录说明
+## 目录与产物
 
-- `server.js`: Express 服务端，同时启动客户端端口和本地管理端口
-- `public/`: 浏览器客户端页面
+仓库目录按源码、文档产物、运行态产物分层：
+
+- `bin/`: CLI 入口，安装后提供 `cloudsyncd` 命令
+- `lib/`: CLI、接收端 profile 和加密协议 helper
+- `server.js`: 分享端 Express 服务，同时启动客户端端口和本地管理端口
+- `public/`: 浏览器接收端页面
 - `admin/`: 本地管理面板
-- `docs/architecture.md`: 运行拓扑和配对 / 下载流程图
-- `pin.js`: 通过本地管理端口生成新 PIN
-- `devices.js`: 设备列表、撤销、主密钥轮换、管理 Token 轮换
-- `share.js`: 把文件或目录加入 `shared/`，默认使用硬链接，失败时回退复制
-- `cloudflared-config.example.yml`: Cloudflare Tunnel 配置模板
+- `share.js` / `pin.js` / `devices.js` / `start.sh`: 兼容旧脚本的服务端操作入口
+- `docs/`: 架构说明、截图和可直接嵌入 README 的图表产物
+- `docs/diagrams/*.puml`: PlantUML 源文件
+- `docs/diagrams/*.png`、`docs/diagrams/*.svg`: 由 PlantUML 渲染出的文档产物，随源码提交
+- `cloudflared-config.example.yml`: Cloudflare Tunnel 配置模板，随源码提交
 - `cloudflared-config.yml`: 本地私有 Tunnel 配置，默认忽略，不提交
-- `data/`: 运行时状态，保存主密钥、已配对设备和管理 Token，必须保持忽略
-- `shared/`: 运行时共享载荷目录，必须保持忽略
+- `data/`: 运行时状态，保存主密钥、已配对设备和管理 Token，默认忽略
+- `shared/`: 运行时共享载荷目录，由服务端或 `share.js` 自动创建，默认忽略
+- `downloads/`: 接收端下载目录，默认忽略
+- `node_modules/`: 本地依赖目录，默认忽略
+
+npm 包产物由 `package.json` 的 `files` 白名单控制，只包含运行所需源码、文档、配置模板和兼容脚本；`test/`、`data/`、`shared/`、本地 Cloudflare credentials、日志和下载缓存不会进入包。
 
 ## 环境要求
 
