@@ -8,6 +8,12 @@ const fs = require('fs');
 const path = require('path');
 const { pipeline, Transform } = require('stream');
 const tar = require('tar');
+const {
+  CHUNKED_ENCRYPTION_MODE,
+  DEFAULT_CHUNK_SIZE,
+  createChunkedEncryptStream,
+  encryptedChunkedContentLength,
+} = require('./lib/chunked-encryption');
 
 const app = express();
 app.disable('x-powered-by');
@@ -40,6 +46,9 @@ const seenRequestNonces = new Map();
 
 const DATA_DIR = path.join(__dirname, 'data');
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
+const ADMIN_TOKEN_FILE = path.join(DATA_DIR, '.admin-token');
+const PRIVATE_DIR_MODE = 0o700;
+const PRIVATE_FILE_MODE = 0o600;
 const sharedDir = path.join(__dirname, 'shared');
 
 // ============ Security Middleware ============
@@ -102,6 +111,38 @@ function authFail(res) {
 
 // ============ Persistent State ============
 
+function chmodBestEffort(target, mode) {
+  try {
+    fs.chmodSync(target, mode);
+  } catch (err) {
+    console.warn(`[STATE] Failed to chmod ${target}: ${err.message}`);
+  }
+}
+
+function ensurePrivateDataDir() {
+  fs.mkdirSync(DATA_DIR, { recursive: true, mode: PRIVATE_DIR_MODE });
+  chmodBestEffort(DATA_DIR, PRIVATE_DIR_MODE);
+}
+
+function ensurePrivateFile(filePath) {
+  if (fs.existsSync(filePath)) chmodBestEffort(filePath, PRIVATE_FILE_MODE);
+}
+
+function writePrivateFile(filePath, data) {
+  ensurePrivateDataDir();
+  const tmpPath = path.join(
+    path.dirname(filePath),
+    `.${path.basename(filePath)}.${process.pid}.${Date.now()}.tmp`
+  );
+  fs.writeFileSync(tmpPath, data, { mode: PRIVATE_FILE_MODE });
+  fs.renameSync(tmpPath, filePath);
+  chmodBestEffort(filePath, PRIVATE_FILE_MODE);
+}
+
+ensurePrivateDataDir();
+ensurePrivateFile(STATE_FILE);
+ensurePrivateFile(ADMIN_TOKEN_FILE);
+
 function loadState() {
   try {
     if (fs.existsSync(STATE_FILE)) {
@@ -112,8 +153,7 @@ function loadState() {
 }
 
 function saveState(data) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(STATE_FILE, JSON.stringify(data, null, 2));
+  writePrivateFile(STATE_FILE, JSON.stringify(data, null, 2));
 }
 
 // Master key + admin token: persisted to state.json so they survive restarts.
@@ -157,10 +197,8 @@ function rotateMasterKey() {
   persistState();
 }
 
-const ADMIN_TOKEN_FILE = path.join(DATA_DIR, '.admin-token');
 const startedAt = Date.now();
-fs.mkdirSync(DATA_DIR, { recursive: true });
-fs.writeFileSync(ADMIN_TOKEN_FILE, adminToken, { mode: 0o600 });
+writePrivateFile(ADMIN_TOKEN_FILE, adminToken);
 
 // ============ Crypto Helpers ============
 
@@ -352,6 +390,45 @@ function streamEncryptedResponse({ res, sourceStream, extraHeaders = {}, label, 
     if (completed) return;
     if (err) {
       console.error(`[${label}] Stream error:`, err.message);
+      finish(err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: `${label} failed` });
+      } else if (!res.destroyed) {
+        res.destroy(err);
+      }
+      return;
+    }
+
+    finish();
+  });
+}
+
+function streamChunkedEncryptedResponse({ res, sourceStream, fileSize, relPath, extraHeaders = {}, label, onComplete }) {
+  const { stream, ivPrefix, tagLength } = createChunkedEncryptStream(masterKey, { fileSize, relPath });
+  let completed = false;
+
+  const finish = (err) => {
+    if (completed) return;
+    completed = true;
+    if (onComplete) onComplete(err);
+  };
+
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Encrypted-Mode', CHUNKED_ENCRYPTION_MODE);
+  res.setHeader('X-Encrypted-IV-Prefix', ivPrefix.toString('hex'));
+  res.setHeader('X-Encrypted-Chunk-Size', String(DEFAULT_CHUNK_SIZE));
+  res.setHeader('X-Encrypted-Tag-Length', String(tagLength));
+  res.setHeader('Content-Length', String(encryptedChunkedContentLength(fileSize, DEFAULT_CHUNK_SIZE, { relPath })));
+
+  for (const [header, value] of Object.entries(extraHeaders)) {
+    res.setHeader(header, value);
+  }
+
+  pipeline(sourceStream, stream, res, (err) => {
+    if (completed) return;
+    if (err) {
+      console.error(`[${label}] Chunked stream error:`, err.message);
       finish(err);
       if (!res.headersSent) {
         res.status(500).json({ error: `${label} failed` });
@@ -579,7 +656,7 @@ adminApp.post('/api/local/rotate-token', (req, res) => {
   }
   adminToken = crypto.randomBytes(16).toString('hex');
   persistState();
-  fs.writeFileSync(ADMIN_TOKEN_FILE, adminToken, { mode: 0o600 });
+  writePrivateFile(ADMIN_TOKEN_FILE, adminToken);
   console.log('[ADMIN] Admin token rotated');
   // Return the new token so the admin session can stay logged in.
   res.json({ success: true, adminToken });
@@ -611,8 +688,7 @@ app.get('/api/files', requireDeviceAuth, (req, res) => {
   res.json({ encrypted: encrypt(masterKey, Buffer.from(JSON.stringify(tree))) });
 });
 
-app.get(/^\/api\/files\/(.*)/, requireDeviceAuth, (req, res) => {
-  const relPath = req.params[0] || '';
+function resolveSharedFile(relPath, res) {
   const filePath = path.resolve(path.join(sharedDir, relPath));
 
   // Containment with real symlink resolution. path.resolve is purely lexical
@@ -624,22 +700,64 @@ app.get(/^\/api\/files\/(.*)/, requireDeviceAuth, (req, res) => {
   try {
     realFile = fs.realpathSync(filePath);
   } catch {
-    return res.status(404).json({ error: 'Not found' });
+    res.status(404).json({ error: 'Not found' });
+    return null;
   }
   const realShared = fs.realpathSync(sharedDir);
   const rel = path.relative(realShared, realFile);
   if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
-    return res.status(403).json({ error: 'Access denied' });
+    res.status(403).json({ error: 'Access denied' });
+    return null;
   }
   let stat;
   try {
     stat = fs.statSync(realFile);
   } catch {
-    return res.status(404).json({ error: 'Not found' });
+    res.status(404).json({ error: 'Not found' });
+    return null;
   }
-  if (!stat.isFile()) return res.status(404).json({ error: 'Not found' });
+  if (!stat.isFile()) {
+    res.status(404).json({ error: 'Not found' });
+    return null;
+  }
 
-  const fileSize = stat.size;
+  return { realFile, rel, stat };
+}
+
+app.get(/^\/api\/files-chunked\/(.*)/, requireDeviceAuth, (req, res) => {
+  const relPath = req.params[0] || '';
+  const file = resolveSharedFile(relPath, res);
+  if (!file) return;
+
+  const fileSize = file.stat.size;
+
+  if (activeDownloads >= MAX_CONCURRENT_DOWNLOADS) {
+    return res.status(503).json({ error: 'Too many concurrent downloads. Please try again later.' });
+  }
+
+  activeDownloads++;
+  streamChunkedEncryptedResponse({
+    res,
+    sourceStream: fs.createReadStream(file.realFile, { highWaterMark: DEFAULT_CHUNK_SIZE }),
+    fileSize,
+    relPath,
+    label: 'FILE-CHUNKED',
+    extraHeaders: {
+      'X-File-Name': encodeURIComponent(path.basename(relPath)),
+      'X-File-Size': String(fileSize),
+    },
+    onComplete: () => {
+      activeDownloads--;
+    },
+  });
+});
+
+app.get(/^\/api\/files\/(.*)/, requireDeviceAuth, (req, res) => {
+  const relPath = req.params[0] || '';
+  const file = resolveSharedFile(relPath, res);
+  if (!file) return;
+
+  const fileSize = file.stat.size;
 
   if (activeDownloads >= MAX_CONCURRENT_DOWNLOADS) {
     return res.status(503).json({ error: 'Too many concurrent downloads. Please try again later.' });
@@ -648,7 +766,7 @@ app.get(/^\/api\/files\/(.*)/, requireDeviceAuth, (req, res) => {
   activeDownloads++;
   streamEncryptedResponse({
     res,
-    sourceStream: fs.createReadStream(realFile),
+    sourceStream: fs.createReadStream(file.realFile),
     label: 'FILE',
     extraHeaders: {
       'Content-Length': String(fileSize + 16),

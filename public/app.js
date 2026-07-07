@@ -48,6 +48,17 @@ const Crypto = {
     return new Uint8Array(await window.crypto.subtle.decrypt({ name: 'AES-GCM', iv: ivBytes }, key, combined));
   },
 
+  async decryptCombinedBytes(keyBytes, ivBytes, encryptedBytes, tagLength = 16, additionalData = null) {
+    const key = await window.crypto.subtle.importKey('raw', keyBytes, 'AES-GCM', false, ['decrypt']);
+    const algorithm = {
+      name: 'AES-GCM',
+      iv: ivBytes,
+      tagLength: tagLength * 8,
+    };
+    if (additionalData) algorithm.additionalData = additionalData;
+    return new Uint8Array(await window.crypto.subtle.decrypt(algorithm, key, encryptedBytes));
+  },
+
   async decrypt(keyBytes, iv, ciphertext, tag) {
     return this.decryptBytes(keyBytes, hex2buf(iv), hex2buf(ciphertext), hex2buf(tag));
   },
@@ -69,6 +80,13 @@ function hex2buf(hex) {
   return b;
 }
 
+const LARGE_FILE_STREAM_THRESHOLD = 32 * 1024 * 1024;
+const CHUNKED_ENCRYPTION_MODE = 'chunked-v2';
+const FINAL_FRAME_MARKER = 0;
+const FINAL_MANIFEST_MAX_BYTES = 64 * 1024;
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
 function safeDecodeHeader(value) {
   if (!value) return '';
   try {
@@ -87,9 +105,7 @@ async function decryptDownloadResponse(res) {
       throw new Error('Encrypted payload is truncated');
     }
 
-    const ciphertext = payload.slice(0, payload.length - tagLength);
-    const tag = payload.slice(payload.length - tagLength);
-    const plainBuf = await Crypto.decryptBytes(encryptionKey, hex2buf(streamIv), ciphertext, tag);
+    const plainBuf = await Crypto.decryptCombinedBytes(encryptionKey, hex2buf(streamIv), payload, tagLength);
 
     return {
       filename: safeDecodeHeader(res.headers.get('x-file-name')),
@@ -119,8 +135,8 @@ async function getErrorMessage(res, fallback) {
   return `${fallback}: ${res.status}`;
 }
 
-function saveBytes(filename, plainBuf) {
-  const blob = new Blob([plainBuf]);
+function saveByteChunks(filename, chunks) {
+  const blob = new Blob(chunks);
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -133,6 +149,182 @@ function saveBytes(filename, plainBuf) {
     URL.revokeObjectURL(url);
     a.remove();
   }, 60000);
+}
+
+function saveBytes(filename, plainBuf) {
+  saveByteChunks(filename, [plainBuf]);
+}
+
+function readUint32BE(bytes) {
+  return ((bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3]) >>> 0;
+}
+
+function chunkIv(prefix, counter) {
+  const iv = new Uint8Array(12);
+  iv.set(prefix, 0);
+  new DataView(iv.buffer).setUint32(8, counter, false);
+  return iv;
+}
+
+function chunkFrameAad(kind, counter, context) {
+  return textEncoder.encode([
+    'cloudsyncd',
+    CHUNKED_ENCRYPTION_MODE,
+    kind,
+    String(counter),
+    String(context.fileSize),
+    String(context.chunkSize),
+    context.relPath,
+  ].join('\n'));
+}
+
+function parseSafeInteger(value, label, min = 0) {
+  const number = Number.parseInt(value || '', 10);
+  if (!Number.isSafeInteger(number) || number < min) throw new Error(`${label} 无效`);
+  return number;
+}
+
+function validateChunkedManifest(manifest, context, chunkCount) {
+  if (!manifest || typeof manifest !== 'object') throw new Error('分块下载缺少 final manifest');
+  if (manifest.mode !== CHUNKED_ENCRYPTION_MODE) throw new Error('分块下载 manifest 模式不匹配');
+  if (manifest.fileSize !== context.fileSize) throw new Error('分块下载文件大小不匹配');
+  if (manifest.chunkSize !== context.chunkSize) throw new Error('分块下载 chunk size 不匹配');
+  if (manifest.chunkCount !== chunkCount) throw new Error('分块下载 chunk 数量不匹配');
+  if (manifest.relPath !== context.relPath) throw new Error('分块下载路径不匹配');
+}
+
+async function* decryptChunkedDownloadResponse(res, relPath, onFinalManifest) {
+  if (!res.body || !res.body.getReader) {
+    throw new Error('浏览器不支持流式下载，无法使用大文件模式');
+  }
+  if (res.headers.get('x-encrypted-mode') !== CHUNKED_ENCRYPTION_MODE) {
+    throw new Error('服务端未返回分块加密响应');
+  }
+
+  const ivPrefix = hex2buf(res.headers.get('x-encrypted-iv-prefix') || '');
+  if (ivPrefix.length !== 8) throw new Error('分块加密响应缺少 IV prefix');
+
+  const tagLength = Number.parseInt(res.headers.get('x-encrypted-tag-length') || '16', 10);
+  const chunkSize = parseSafeInteger(res.headers.get('x-encrypted-chunk-size'), '分块大小', 1);
+  const fileSize = parseSafeInteger(res.headers.get('x-file-size'), '文件大小');
+  const context = { fileSize, chunkSize, relPath };
+  if (!Number.isFinite(tagLength) || tagLength <= 0) throw new Error('分块加密 tag 长度无效');
+
+  const reader = res.body.getReader();
+  let pending = new Uint8Array(0);
+  let counter = 0;
+
+  async function readExact(size) {
+    while (pending.length < size) {
+      const { value, done } = await reader.read();
+      if (done) {
+        if (pending.length === 0) return null;
+        throw new Error('分块加密响应被截断');
+      }
+      if (!value || value.length === 0) continue;
+      const merged = new Uint8Array(pending.length + value.length);
+      merged.set(pending);
+      merged.set(value, pending.length);
+      pending = merged;
+    }
+    const out = pending.slice(0, size);
+    pending = pending.slice(size);
+    return out;
+  }
+
+  for (;;) {
+    const header = await readExact(4);
+    if (!header) throw new Error('分块加密响应缺少 final manifest');
+
+    const encryptedLength = readUint32BE(header);
+    if (encryptedLength === FINAL_FRAME_MARKER) {
+      const manifestHeader = await readExact(4);
+      if (!manifestHeader) throw new Error('分块加密 final manifest header 被截断');
+      const manifestLength = readUint32BE(manifestHeader);
+      if (manifestLength < tagLength || manifestLength > FINAL_MANIFEST_MAX_BYTES) {
+        throw new Error('分块加密 final manifest 长度无效');
+      }
+      const encryptedManifest = await readExact(manifestLength);
+      if (!encryptedManifest) throw new Error('分块加密 final manifest 被截断');
+      const manifestBytes = await Crypto.decryptCombinedBytes(
+        encryptionKey,
+        chunkIv(ivPrefix, counter),
+        encryptedManifest,
+        tagLength,
+        chunkFrameAad('final', counter, context)
+      );
+      const manifest = JSON.parse(textDecoder.decode(manifestBytes));
+      validateChunkedManifest(manifest, context, counter);
+      const extra = await readExact(1);
+      if (extra) throw new Error('分块加密 final manifest 后存在多余数据');
+      onFinalManifest(manifest);
+      return;
+    }
+
+    if (encryptedLength < tagLength || encryptedLength > chunkSize + tagLength) {
+      throw new Error('分块加密帧长度无效');
+    }
+
+    const encrypted = await readExact(encryptedLength);
+    if (!encrypted) throw new Error('分块加密响应被截断');
+
+    yield await Crypto.decryptCombinedBytes(
+      encryptionKey,
+      chunkIv(ivPrefix, counter),
+      encrypted,
+      tagLength,
+      chunkFrameAad('data', counter, context)
+    );
+    counter += 1;
+  }
+}
+
+function canStreamToDisk() {
+  return window.isSecureContext && typeof window.showSaveFilePicker === 'function';
+}
+
+async function openWritableDownload(filename) {
+  const handle = await window.showSaveFilePicker({ suggestedName: filename });
+  return handle.createWritable();
+}
+
+function assertChunkedDownloadComplete(finalManifest, total) {
+  if (!finalManifest) throw new Error('分块下载未收到 final manifest');
+  if (total !== finalManifest.fileSize) {
+    throw new Error(`分块下载大小不匹配: expected ${finalManifest.fileSize}, got ${total}`);
+  }
+}
+
+async function saveChunkedDownloadResponse(res, filename, writable, relPath) {
+  let total = 0;
+  let finalManifest = null;
+  const onFinalManifest = (manifest) => {
+    finalManifest = manifest;
+  };
+
+  if (writable) {
+    try {
+      for await (const chunk of decryptChunkedDownloadResponse(res, relPath, onFinalManifest)) {
+        await writable.write(chunk);
+        total += chunk.length;
+      }
+      assertChunkedDownloadComplete(finalManifest, total);
+      await writable.close();
+      return { bytes: total, streamedToDisk: true };
+    } catch (err) {
+      try { await writable.abort(); } catch {}
+      throw err;
+    }
+  }
+
+  const chunks = [];
+  for await (const chunk of decryptChunkedDownloadResponse(res, relPath, onFinalManifest)) {
+    chunks.push(chunk);
+    total += chunk.length;
+  }
+  assertChunkedDownloadComplete(finalManifest, total);
+  saveByteChunks(filename, chunks);
+  return { bytes: total, streamedToDisk: false };
 }
 
 async function sha256Hex(data) {
@@ -537,23 +729,57 @@ function teardownScrollLoader() {
 
 async function downloadFile(name, li) {
   if (li.classList.contains('downloading')) return;
+  let writable = null;
   li.classList.add('downloading');
   li.querySelector('.file-dl').textContent = '解密中...';
 
   try {
     // Encode each path segment separately to preserve slashes
     const encodedPath = name.split('/').map(encodeURIComponent).join('/');
-    const res = await apiFetch(`/api/files/${encodedPath}`);
+    const entry = allEntries.find(item => item.type === 'file' && item.name === name);
+    const baseName = name.split('/').pop() || 'download.bin';
+    const useChunkedDownload = entry && entry.size >= LARGE_FILE_STREAM_THRESHOLD && window.ReadableStream;
+
+    if (useChunkedDownload && canStreamToDisk()) {
+      li.querySelector('.file-dl').textContent = '保存中...';
+      try {
+        writable = await openWritableDownload(baseName);
+      } catch (err) {
+        if (err && err.name === 'AbortError') {
+          toast('已取消下载', 'info');
+          return;
+        }
+        throw err;
+      }
+      li.querySelector('.file-dl').textContent = '解密中...';
+    }
+
+    const endpoint = useChunkedDownload ? `/api/files-chunked/${encodedPath}` : `/api/files/${encodedPath}`;
+    const res = await apiFetch(endpoint);
     if (res.status === 401 || res.status === 403) {
+      if (writable) {
+        try { await writable.abort(); } catch {}
+        writable = null;
+      }
       await resetToPairing('配对已失效，请在服务端生成新 PIN 后重新配对');
       return;
     }
     if (!res.ok) throw new Error(await getErrorMessage(res, 'Download failed'));
-    const { filename, plainBuf } = await decryptDownloadResponse(res);
 
-    saveBytes(filename || name.split('/').pop(), plainBuf);
-    toast(`${name.split('/').pop()} 下载完成`, 'ok');
+    if (useChunkedDownload) {
+      const filename = safeDecodeHeader(res.headers.get('x-file-name')) || baseName;
+      const result = await saveChunkedDownloadResponse(res, filename, writable, name);
+      writable = null;
+      toast(`${baseName} 下载完成${result.streamedToDisk ? '' : '（内存回退）'}`, 'ok');
+    } else {
+      const { filename, plainBuf } = await decryptDownloadResponse(res);
+      saveBytes(filename || baseName, plainBuf);
+      toast(`${baseName} 下载完成`, 'ok');
+    }
   } catch (err) {
+    if (writable) {
+      try { await writable.abort(); } catch {}
+    }
     toast('下载失败: ' + err.message, 'err');
   } finally {
     li.classList.remove('downloading');
@@ -722,14 +948,23 @@ async function batchDownload() {
 
     try {
       const encodedPath = fileName.split('/').map(encodeURIComponent).join('/');
-      const res = await apiFetch(`/api/files/${encodedPath}`);
+      const entry = allEntries.find(item => item.type === 'file' && item.name === fileName);
+      const useChunkedDownload = entry && entry.size >= LARGE_FILE_STREAM_THRESHOLD && window.ReadableStream;
+      const endpoint = useChunkedDownload ? `/api/files-chunked/${encodedPath}` : `/api/files/${encodedPath}`;
+      const res = await apiFetch(endpoint);
       if (res.status === 401 || res.status === 403) {
         await resetToPairing('配对已失效，请在服务端生成新 PIN 后重新配对');
         return;
       }
       if (!res.ok) throw new Error(await getErrorMessage(res, 'Download failed'));
-      const { filename, plainBuf } = await decryptDownloadResponse(res);
-      saveBytes(filename || fileName.split('/').pop(), plainBuf);
+      const baseName = fileName.split('/').pop() || 'download.bin';
+      if (useChunkedDownload) {
+        const filename = safeDecodeHeader(res.headers.get('x-file-name')) || baseName;
+        await saveChunkedDownloadResponse(res, filename, null, fileName);
+      } else {
+        const { filename, plainBuf } = await decryptDownloadResponse(res);
+        saveBytes(filename || baseName, plainBuf);
+      }
       downloadedCount++;
     } catch (err) {
       console.error(`Failed to download ${fileName}:`, err);

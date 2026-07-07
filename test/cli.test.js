@@ -4,6 +4,7 @@ const fs = require('fs');
 const http = require('http');
 const os = require('os');
 const path = require('path');
+const { Readable } = require('stream');
 const test = require('node:test');
 
 const client = require('../lib/client');
@@ -22,6 +23,11 @@ const {
   stopTunnel,
   usage,
 } = require('../lib/cli');
+const {
+  createChunkedEncryptStream,
+  decryptChunkedFrames,
+  encryptedChunkedContentLength,
+} = require('../lib/chunked-encryption');
 const {
   buildRequestSignatureMessage,
   decryptEnvelope,
@@ -49,6 +55,12 @@ function encryptedStreamPayload(key, plaintext) {
     iv,
     payload: Buffer.concat([ciphertext, cipher.getAuthTag()]),
   };
+}
+
+async function collectStream(readable) {
+  const chunks = [];
+  for await (const chunk of readable) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
 }
 
 async function startMockShareServer() {
@@ -424,6 +436,64 @@ test('protocol helpers encode remote paths and sign request messages', () => {
     buildRequestSignatureMessage('GET', '/api/files/a%20b.txt', '1', 'n', crypto.createHash('sha256').update(Buffer.alloc(0)).digest('hex'))
   );
   assert.strictEqual(headers['X-Auth-Signature'], expected);
+});
+
+test('chunked encryption frames decrypt after fixed-size stream chunking', async () => {
+  const key = crypto.randomBytes(32);
+  const chunkSize = 1024;
+  const ivPrefix = Buffer.alloc(8, 7);
+  const relPath = '目录/file.bin';
+  const plain = Buffer.alloc(chunkSize * 3 + 123);
+  for (let i = 0; i < plain.length; i += 1) plain[i] = i & 0xff;
+
+  const { stream } = createChunkedEncryptStream(key, { ivPrefix, chunkSize, fileSize: plain.length, relPath });
+  const encrypted = await collectStream(Readable.from([
+    plain.subarray(0, 17),
+    plain.subarray(17, chunkSize + 19),
+    plain.subarray(chunkSize + 19),
+  ]).pipe(stream));
+
+  assert.strictEqual(encrypted.length, encryptedChunkedContentLength(plain.length, chunkSize, { relPath }));
+
+  const decrypted = decryptChunkedFrames(encrypted, key, ivPrefix, {
+    chunkSize,
+    fileSize: plain.length,
+    relPath,
+  });
+  assert.deepStrictEqual(decrypted.plaintext, plain);
+  assert.strictEqual(decrypted.manifest.chunkCount, 4);
+
+  const dataOnlyLength = plain.length + decrypted.manifest.chunkCount * (4 + 16);
+  assert.throws(
+    () => decryptChunkedFrames(encrypted.subarray(0, dataOnlyLength), key, ivPrefix, {
+      chunkSize,
+      fileSize: plain.length,
+      relPath,
+    }),
+    /Missing final manifest/
+  );
+  assert.throws(
+    () => decryptChunkedFrames(encrypted, key, ivPrefix, {
+      chunkSize,
+      fileSize: plain.length,
+      relPath: 'other.bin',
+    }),
+    /authenticate/
+  );
+
+  const emptyIvPrefix = Buffer.alloc(8, 9);
+  const { stream: emptyStream } = createChunkedEncryptStream(key, {
+    ivPrefix: emptyIvPrefix,
+    chunkSize,
+    fileSize: 0,
+    relPath: '',
+  });
+  const emptyEncrypted = await collectStream(Readable.from([]).pipe(emptyStream));
+  assert.strictEqual(emptyEncrypted.length, encryptedChunkedContentLength(0, chunkSize, { relPath: '' }));
+  assert.deepStrictEqual(
+    decryptChunkedFrames(emptyEncrypted, key, emptyIvPrefix, { chunkSize, fileSize: 0, relPath: '' }).plaintext,
+    Buffer.alloc(0)
+  );
 });
 
 test('client list auto-pairs and stores a receiver profile', async () => {

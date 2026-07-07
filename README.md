@@ -40,6 +40,8 @@ cloudsyncd client list https://your-sync-host.example
 cloudsyncd client get https://your-sync-host.example "dir/file.pdf"
 ```
 
+浏览器接收端支持大文件分块解密和认证完成校验；Chrome / Edge 等支持 File System Access API 的浏览器会直接流式写入磁盘。
+
 没有全局安装时也可以直接运行：
 
 ```bash
@@ -167,7 +169,7 @@ npm 包由 `package.json` 的 `files` 白名单控制，不包含 `test/`、`dat
 
 ## 安全边界
 
-- `data/state.json` 含主密钥和管理 Token，必须保持忽略。
+- `data/state.json` 含主密钥和管理 Token，必须保持忽略；服务端启动时会把 `data/` 收紧到 `0700`，把密钥文件收紧到 `0600`。
 - `shared/` 中的文件会对已配对设备可见。
 - 浏览器接收端会把主密钥保存在 IndexedDB。
 - 所有已配对设备共享同一个主密钥；轮换主密钥后全部设备需要重新配对。
