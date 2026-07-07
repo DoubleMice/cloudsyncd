@@ -487,6 +487,26 @@ test('client pairing with invalid PIN does not save a profile', async () => {
   }
 });
 
+test('client reports actionable network errors for unreachable share URL', async () => {
+  withTempConfig();
+  const probe = http.createServer();
+  await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve));
+  const { port } = probe.address();
+  await new Promise((resolve) => probe.close(resolve));
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  await assert.rejects(
+    () => client.listFiles(baseUrl),
+    (err) => {
+      assert.match(err.message, new RegExp(`Cannot reach cloudsyncd share URL: http://127\\.0\\.0\\.1:${port}/api/pair/init`));
+      assert.match(err.message, /Check the URL, DNS\/TLS, firewall/);
+      assert.match(err.message, /127\.0\.0\.1:21891/);
+      assert.notStrictEqual(err.message, 'fetch failed');
+      return true;
+    }
+  );
+});
+
 test('client get decrypts unicode path downloads and refuses overwrite', async () => {
   const dir = withTempConfig();
   const server = await startMockShareServer();
