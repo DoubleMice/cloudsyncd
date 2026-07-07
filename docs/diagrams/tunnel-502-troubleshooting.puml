@@ -1,0 +1,39 @@
+@startuml
+!theme plain
+
+title cloudsyncd Cloudflare Tunnel 502 troubleshooting
+
+actor "Remote browser" as Browser
+participant "Cloudflare Edge\npublic hostname" as Edge
+participant "cloudflared\nlocal tunnel process" as Tunnel
+participant "Node origin\n127.0.0.1:21891" as Origin
+actor "Local operator" as Operator
+
+Browser -> Edge : GET /api/status
+Edge -> Tunnel : proxy request over tunnel
+Tunnel -> Origin : HTTP GET /api/status
+
+alt origin is listening
+  Origin --> Tunnel : 200 {"paired":...}
+  Tunnel --> Edge : origin response
+  Edge --> Browser : 200 OK
+else origin is down
+  Origin -[#red]x Tunnel : connection refused
+  Tunnel --> Edge : origin service unreachable
+  Edge --> Browser : 502 Bad Gateway
+  Operator -> Operator : lsof -nP -iTCP:21891\ncurl http://127.0.0.1:21891/api/status
+  Operator -> Origin : cloudsyncd server start\nor node server.js
+  Operator -> Tunnel : tail /tmp/cloudflared-sync.log
+  Browser -> Edge : retry /api/status
+  Edge -> Tunnel : proxy request
+  Tunnel -> Origin : HTTP GET /api/status
+  Origin --> Tunnel : 200 {"paired":...}
+  Edge --> Browser : 200 OK
+end
+
+note over Tunnel, Origin
+  cloudsyncd server start --tunnel starts both layers.
+  cloudsyncd server tunnel start starts only cloudflared.
+end note
+
+@enduml

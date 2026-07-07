@@ -2,9 +2,17 @@
 # Copy this file to cloudflared-config.yml and fill in your own deployment
 # values. cloudflared-config.yml is ignored by Git because it contains
 # deployment-specific identifiers and credential paths.
+# Before first use, create a named tunnel with cloudflared tunnel create <name>.
+#
+# One-time setup after filling this file:
+#   cloudsyncd server tunnel setup
+# Or validate, route DNS, and start the tunnel in one command:
+#   cloudsyncd server tunnel setup --start
 #
 # Run with:
-#   cloudflared tunnel --config cloudflared-config.yml run <tunnel-name>
+#   cloudsyncd server start --tunnel
+# or:
+#   cloudsyncd server tunnel start
 
 tunnel: <your-tunnel-id-or-name>
 credentials-file: /path/to/.cloudflared/<your-tunnel-id>.json

@@ -12,7 +12,7 @@ node "Host machine" as Host {
   component "cloudflared\nnamed tunnel: sync" as Tunnel
 
   node "Node process\nserver.js" as Node {
-    component "client Express app\n127.0.0.1:21891" as ClientApp
+    component "client Express app\n127.0.0.1:21891\nmust be listening" as ClientApp
     component "admin Express app\n127.0.0.1:21900" as AdminApp
   }
 
@@ -46,6 +46,12 @@ note bottom of ClientApp
   Public routes use security headers,
   per-request HMAC, timestamp window,
   and nonce replay protection.
+end note
+
+note bottom of Tunnel
+  A registered tunnel is not enough.
+  If 127.0.0.1:21891 is down,
+  Cloudflare returns 502.
 end note
 
 @enduml

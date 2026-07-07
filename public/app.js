@@ -171,6 +171,15 @@ const KeyStore = {
       req.onerror = () => reject(req.error);
     });
   },
+  async delete(key) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(this.STORE_NAME, 'readwrite');
+      tx.objectStore(this.STORE_NAME).delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  },
 };
 
 // ============ Toast Notifications ============
@@ -189,6 +198,8 @@ function toast(msg, type = 'info') {
 let encryptionKey = null;
 let deviceId = null;
 let fileRefreshTimer = null;
+let scrollObserver = null;
+let scrollLoaderInterval = null;
 
 function showScreen(id) {
   document.querySelectorAll('.screen').forEach(s => {
@@ -209,6 +220,23 @@ function showMainScreen() {
 function showPairScreen() {
   showScreen('pair-screen');
   if (fileRefreshTimer) { clearInterval(fileRefreshTimer); fileRefreshTimer = null; }
+  teardownScrollLoader();
+}
+
+async function clearStoredPairing() {
+  encryptionKey = null;
+  deviceId = null;
+  await Promise.all([
+    KeyStore.delete('encryptionKey'),
+    KeyStore.delete('deviceId'),
+  ]);
+}
+
+async function resetToPairing(reason) {
+  await clearStoredPairing();
+  showPairScreen();
+  setStatus('error', reason);
+  setTimeout(() => document.querySelector('.pin-input')?.focus(), 100);
 }
 
 function buildSignedPath(pathname) {
@@ -359,6 +387,10 @@ async function loadFiles() {
 
   try {
     const res = await apiFetch('/api/files');
+    if (res.status === 401 || res.status === 403) {
+      await resetToPairing('配对已失效，请在服务端生成新 PIN 后重新配对');
+      return;
+    }
     if (!res.ok) throw new Error('Failed to load files');
     const { encrypted } = await res.json();
 
@@ -366,6 +398,7 @@ async function loadFiles() {
     allEntries = JSON.parse(new TextDecoder().decode(plainBuf));
     currentPage = 0;
 
+    teardownScrollLoader();
     listEl.innerHTML = '';
     if (allEntries.length === 0) {
       listEl.innerHTML = '<li class="empty-state"><div class="empty-icon">📁</div>暂无共享文件<br><span style="font-size:0.72rem;color:var(--text-3)">将文件放入 shared/ 目录即可</span></li>';
@@ -457,18 +490,6 @@ function renderNextPage() {
     listEl.appendChild(loadMoreLi);
   }
 
-  // Attach click handlers for newly added items
-  const newItems = listEl.querySelectorAll(`li[data-name]:nth-child(n-${end})`);
-  newItems.forEach(li => {
-    if (!li.classList.contains('dir-item')) {
-      li.addEventListener('click', (e) => {
-        if (!e.target.closest('.file-checkbox') && !e.target.closest('.file-checkbox-label')) {
-          downloadFile(li.dataset.name, li);
-        }
-      });
-    }
-  });
-
   isLoading = false;
 }
 
@@ -486,19 +507,32 @@ function toggleDir(dirLi, dirName) {
 }
 
 function setupScrollLoader(listEl) {
+  teardownScrollLoader();
   const observer = new IntersectionObserver((entries) => {
     if (entries[0].isIntersecting && !isLoading) {
       const loadMoreEl = listEl.querySelector('.load-more');
       if (loadMoreEl) renderNextPage();
     }
   }, { rootMargin: '100px' });
+  scrollObserver = observer;
   
   const checkLoader = () => {
     const loadMoreEl = listEl.querySelector('.load-more');
     if (loadMoreEl) observer.observe(loadMoreEl);
   };
   checkLoader();
-  setInterval(checkLoader, 500);
+  scrollLoaderInterval = setInterval(checkLoader, 500);
+}
+
+function teardownScrollLoader() {
+  if (scrollObserver) {
+    scrollObserver.disconnect();
+    scrollObserver = null;
+  }
+  if (scrollLoaderInterval) {
+    clearInterval(scrollLoaderInterval);
+    scrollLoaderInterval = null;
+  }
 }
 
 async function downloadFile(name, li) {
@@ -510,6 +544,10 @@ async function downloadFile(name, li) {
     // Encode each path segment separately to preserve slashes
     const encodedPath = name.split('/').map(encodeURIComponent).join('/');
     const res = await apiFetch(`/api/files/${encodedPath}`);
+    if (res.status === 401 || res.status === 403) {
+      await resetToPairing('配对已失效，请在服务端生成新 PIN 后重新配对');
+      return;
+    }
     if (!res.ok) throw new Error(await getErrorMessage(res, 'Download failed'));
     const { filename, plainBuf } = await decryptDownloadResponse(res);
 
@@ -685,6 +723,10 @@ async function batchDownload() {
     try {
       const encodedPath = fileName.split('/').map(encodeURIComponent).join('/');
       const res = await apiFetch(`/api/files/${encodedPath}`);
+      if (res.status === 401 || res.status === 403) {
+        await resetToPairing('配对已失效，请在服务端生成新 PIN 后重新配对');
+        return;
+      }
       if (!res.ok) throw new Error(await getErrorMessage(res, 'Download failed'));
       const { filename, plainBuf } = await decryptDownloadResponse(res);
       saveBytes(filename || fileName.split('/').pop(), plainBuf);
@@ -762,14 +804,16 @@ function setupEventListeners() {
       return;
     }
 
-    // Handle file item click in selection mode
-    if (selectionMode) {
-      const li = e.target.closest('.file-item');
-      if (li && li.dataset.name && !e.target.closest('.file-dl')) {
-        e.stopPropagation();
-        toggleSelection(null, li.dataset.name, li);
-      }
+    const li = e.target.closest('.file-item');
+    if (!li || !li.dataset.name) return;
+
+    if (selectionMode && !e.target.closest('.file-dl')) {
+      e.stopPropagation();
+      toggleSelection(null, li.dataset.name, li);
+      return;
     }
+
+    downloadFile(li.dataset.name, li);
   });
 
   // Bottom action bar click close
@@ -803,6 +847,7 @@ async function init() {
         showMainScreen();
         return;
       }
+      await clearStoredPairing();
     } catch { /* server not paired */ }
   }
 

@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 
 const ADMIN_PORT = process.env.ADMIN_PORT || 21900;
+const ADMIN_HOST = process.env.ADMIN_HOST || '127.0.0.1';
 const tokenFile = path.join(__dirname, 'data', '.admin-token');
 
 let token;
@@ -13,13 +14,19 @@ try {
   process.exit(1);
 }
 
-fetch(`http://127.0.0.1:${ADMIN_PORT}/api/local/new-pin`, {
-  method: 'POST',
-  headers: { 'x-admin-token': token },
-})
-  .then(r => r.json())
-  .then(data => {
-    if (data.pin) console.log(`\nNew pairing PIN: ${data.pin}\n`);
-    else console.error('Error:', data.error);
-  })
-  .catch(() => console.error('Server not running?'));
+(async () => {
+  try {
+    const res = await fetch(`http://${ADMIN_HOST}:${ADMIN_PORT}/api/local/new-pin`, {
+      method: 'POST',
+      headers: { 'x-admin-token': token },
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.pin) {
+      throw new Error(data.error || `HTTP ${res.status}`);
+    }
+    console.log(`\nNew pairing PIN: ${data.pin}\n`);
+  } catch (err) {
+    console.error('Error:', err.message || 'Server not running?');
+    process.exit(1);
+  }
+})();

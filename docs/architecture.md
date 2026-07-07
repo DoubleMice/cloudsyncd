@@ -22,6 +22,45 @@
 - 管理端口默认绑定 `127.0.0.1:21900`，不在 tunnel ingress 规则中。
 - 公网 hostname 只应到达客户端 Express app；`/admin`、`/admin.js`、`/api/local/*` 不应通过公网命中管理端。
 - HSTS 不在 Node origin 上设置；origin 是本机 HTTP，公网 HTTPS 由 Cloudflare 边缘终止。
+- Cloudflare Tunnel 注册成功只说明公网到 `cloudflared` 的连接可用；如果 `server.js` 没有监听 `127.0.0.1:21891`，公网仍会返回 502。
+
+## 502 排障流程
+
+![cloudsyncd Cloudflare Tunnel 502 troubleshooting](./diagrams/tunnel-502-troubleshooting.png)
+
+公网 502 通常发生在 `cloudflared -> 127.0.0.1:21891` 这一段。按下面顺序检查：
+
+1. 确认本机 origin 是否监听：
+
+   ```bash
+   lsof -nP -iTCP:21891 -sTCP:LISTEN
+   curl -i http://127.0.0.1:21891/api/status
+   ```
+
+2. 确认 tunnel 进程和日志：
+
+   ```bash
+   ps -ef | rg cloudflared
+   tail -n 80 /tmp/cloudflared-sync.log
+   ```
+
+3. 若日志出现 `connect: connection refused`，说明 tunnel 正常但 Node origin 没运行。启动服务：
+
+   ```bash
+   cloudsyncd server start
+   ```
+
+4. 若要一次启动服务和 tunnel：
+
+   ```bash
+   cloudsyncd server start --tunnel
+   ```
+
+5. 重新验证公网健康：
+
+   ```bash
+   curl -i https://<your-sync-hostname>/api/status
+   ```
 
 ## 配对和下载流程
 
@@ -43,6 +82,9 @@
 - PlantUML 源码: [runtime-topology.puml](./diagrams/runtime-topology.puml)
 - PNG: [runtime-topology.png](./diagrams/runtime-topology.png)
 - SVG: [runtime-topology.svg](./diagrams/runtime-topology.svg)
+- PlantUML 源码: [tunnel-502-troubleshooting.puml](./diagrams/tunnel-502-troubleshooting.puml)
+- PNG: [tunnel-502-troubleshooting.png](./diagrams/tunnel-502-troubleshooting.png)
+- SVG: [tunnel-502-troubleshooting.svg](./diagrams/tunnel-502-troubleshooting.svg)
 - PlantUML 源码: [pairing-download-sequence.puml](./diagrams/pairing-download-sequence.puml)
 - PNG: [pairing-download-sequence.png](./diagrams/pairing-download-sequence.png)
 - SVG: [pairing-download-sequence.svg](./diagrams/pairing-download-sequence.svg)
