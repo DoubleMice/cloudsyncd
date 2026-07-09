@@ -84,8 +84,40 @@ const LARGE_FILE_STREAM_THRESHOLD = 32 * 1024 * 1024;
 const CHUNKED_ENCRYPTION_MODE = 'chunked-v2';
 const FINAL_FRAME_MARKER = 0;
 const FINAL_MANIFEST_MAX_BYTES = 64 * 1024;
+const DOWNLOAD_SW_PATH = '/download-sw.js';
+const DOWNLOAD_SW_PREFIX = '/__cloudsyncd_download__/';
+const DOWNLOAD_SW_PROTOCOL = 'chunked-fetch-v1';
+const DOWNLOAD_READY_TIMEOUT_MS = 8000;
+const DOWNLOAD_MODE_KEY = 'cloudsyncd-download-mode';
+const BLOB_DOWNLOAD_FALLBACK_MAX_BYTES = 32 * 1024 * 1024;
+const DOWNLOAD_COMPLETE_HOLD_MS = 3000;
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
+
+// ============ Theme (light/dark) ============
+
+const THEME_KEY = 'cloudsyncd-theme';
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  const themeColor = document.querySelector('meta[name="theme-color"]');
+  if (themeColor) themeColor.setAttribute('content', theme === 'light' ? '#f6f8fb' : '#0a0d12');
+  const colorScheme = document.querySelector('meta[name="color-scheme"]');
+  if (colorScheme) colorScheme.setAttribute('content', theme);
+}
+function initTheme() {
+  let theme = null;
+  try { theme = localStorage.getItem(THEME_KEY); } catch {}
+  if (theme !== 'light' && theme !== 'dark') {
+    theme = (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
+  }
+  applyTheme(theme);
+}
+function toggleTheme() {
+  const next = (document.documentElement.getAttribute('data-theme') === 'light') ? 'dark' : 'light';
+  applyTheme(next);
+  try { localStorage.setItem(THEME_KEY, next); } catch {}
+}
+initTheme();
 
 function safeDecodeHeader(value) {
   if (!value) return '';
@@ -211,25 +243,62 @@ async function* decryptChunkedDownloadResponse(res, relPath, onFinalManifest) {
   if (!Number.isFinite(tagLength) || tagLength <= 0) throw new Error('分块加密 tag 长度无效');
 
   const reader = res.body.getReader();
-  let pending = new Uint8Array(0);
+  const pendingChunks = [];
+  let pendingBytes = 0;
   let counter = 0;
 
+  function enqueue(chunk) {
+    if (!chunk || chunk.length === 0) return;
+    pendingChunks.push(chunk);
+    pendingBytes += chunk.length;
+  }
+
+  function readQueued(size) {
+    if (pendingBytes < size) return null;
+    if (size === 0) return new Uint8Array(0);
+
+    const first = pendingChunks[0];
+    if (first.length === size) {
+      pendingChunks.shift();
+      pendingBytes -= size;
+      return first;
+    }
+    if (first.length > size) {
+      const out = first.subarray(0, size);
+      pendingChunks[0] = first.subarray(size);
+      pendingBytes -= size;
+      return out;
+    }
+
+    const out = new Uint8Array(size);
+    let offset = 0;
+    let remaining = size;
+    while (remaining > 0) {
+      const head = pendingChunks[0];
+      const take = Math.min(head.length, remaining);
+      out.set(head.subarray(0, take), offset);
+      offset += take;
+      remaining -= take;
+      if (take === head.length) {
+        pendingChunks.shift();
+      } else {
+        pendingChunks[0] = head.subarray(take);
+      }
+    }
+    pendingBytes -= size;
+    return out;
+  }
+
   async function readExact(size) {
-    while (pending.length < size) {
+    while (pendingBytes < size) {
       const { value, done } = await reader.read();
       if (done) {
-        if (pending.length === 0) return null;
+        if (pendingBytes === 0) return null;
         throw new Error('分块加密响应被截断');
       }
-      if (!value || value.length === 0) continue;
-      const merged = new Uint8Array(pending.length + value.length);
-      merged.set(pending);
-      merged.set(value, pending.length);
-      pending = merged;
+      enqueue(value);
     }
-    const out = pending.slice(0, size);
-    pending = pending.slice(size);
-    return out;
+    return readQueued(size);
   }
 
   for (;;) {
@@ -285,7 +354,360 @@ function canStreamToDisk() {
 
 async function openWritableDownload(filename) {
   const handle = await window.showSaveFilePicker({ suggestedName: filename });
-  return handle.createWritable();
+  const writable = await handle.createWritable();
+  return {
+    mode: 'filesystem',
+    write: (chunk) => writable.write(chunk),
+    close: () => writable.close(),
+    abort: () => writable.abort(),
+  };
+}
+
+function downloadModePreference() {
+  try {
+    return localStorage.getItem(DOWNLOAD_MODE_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+function wantsBrowserManagedDownload() {
+  return downloadModePreference() === 'browser';
+}
+
+function wantsFilesystemDownload() {
+  return downloadModePreference() === 'filesystem';
+}
+
+function downloadStreamSupported() {
+  return (
+    window.isSecureContext
+    && 'serviceWorker' in navigator
+    && typeof ReadableStream !== 'undefined'
+    && typeof MessageChannel !== 'undefined'
+  );
+}
+
+function waitForControllerChange(timeoutMs = DOWNLOAD_READY_TIMEOUT_MS) {
+  if (navigator.serviceWorker.controller) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      clearTimeout(timer);
+      resolve(true);
+    }, { once: true });
+  });
+}
+
+function waitForNextControllerChange(timeoutMs = DOWNLOAD_READY_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      clearTimeout(timer);
+      resolve(true);
+    }, { once: true });
+  });
+}
+
+function waitForWorkerState(worker, targetState, timeoutMs = DOWNLOAD_READY_TIMEOUT_MS) {
+  if (!worker || worker.state === targetState) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    worker.addEventListener('statechange', () => {
+      if (worker.state !== targetState) return;
+      clearTimeout(timer);
+      resolve(true);
+    });
+  });
+}
+
+async function registerDownloadServiceWorker() {
+  let registration;
+  try {
+    registration = await navigator.serviceWorker.register(DOWNLOAD_SW_PATH, { updateViaCache: 'none' });
+  } catch (err) {
+    if (!(err instanceof TypeError)) throw err;
+    registration = await navigator.serviceWorker.register(DOWNLOAD_SW_PATH);
+  }
+  return registration;
+}
+
+async function pingDownloadServiceWorker(worker, timeoutMs = 1000) {
+  if (!worker) return false;
+  return new Promise((resolve) => {
+    const channel = new MessageChannel();
+    const timer = setTimeout(() => {
+      channel.port1.close();
+      resolve(false);
+    }, timeoutMs);
+    channel.port1.onmessage = (event) => {
+      clearTimeout(timer);
+      channel.port1.close();
+      const data = event.data || {};
+      resolve(data.type === 'cloudsyncd-download-pong' && data.protocol === DOWNLOAD_SW_PROTOCOL);
+    };
+    try {
+      worker.postMessage({ type: 'cloudsyncd-download-ping' }, [channel.port2]);
+    } catch {
+      clearTimeout(timer);
+      channel.port1.close();
+      resolve(false);
+    }
+  });
+}
+
+async function activateCandidateServiceWorker(registration) {
+  const candidate = registration.installing || registration.waiting;
+  if (!candidate) return;
+  const nextController = navigator.serviceWorker.controller
+    ? waitForNextControllerChange(2500)
+    : waitForControllerChange(2500);
+  try { candidate.postMessage({ type: 'cloudsyncd-skip-waiting' }); } catch {}
+  await waitForWorkerState(candidate, 'activated');
+  await nextController;
+}
+
+async function ensureDownloadServiceWorker() {
+  if (!downloadStreamSupported()) throw new Error('浏览器不支持下载 service worker');
+  const registration = await registerDownloadServiceWorker();
+  try { await registration.update(); } catch {}
+  await navigator.serviceWorker.ready;
+  await activateCandidateServiceWorker(registration);
+  if (!navigator.serviceWorker.controller) await waitForControllerChange();
+
+  let worker = navigator.serviceWorker.controller;
+  if (await pingDownloadServiceWorker(worker)) return worker;
+
+  try { await registration.update(); } catch {}
+  await activateCandidateServiceWorker(registration);
+  await waitForControllerChange(1500);
+
+  worker = navigator.serviceWorker.controller;
+  if (await pingDownloadServiceWorker(worker)) return worker;
+  throw new Error('下载 service worker 版本过旧，请刷新页面后重试');
+}
+
+function requireDownloadServiceWorkerController() {
+  if (!downloadStreamSupported()) throw new Error('浏览器不支持下载 service worker');
+  if (!navigator.serviceWorker.controller) {
+    throw new Error('下载 service worker 未接管页面，请刷新页面后重试');
+  }
+  return navigator.serviceWorker.controller;
+}
+
+async function warmDownloadServiceWorker() {
+  if (!downloadStreamSupported()) return;
+  try {
+    await ensureDownloadServiceWorker();
+  } catch (err) {
+    console.info('Browser-managed downloads will be enabled after this page is reloaded:', err.message);
+  }
+}
+
+function transferableChunk(chunk) {
+  if (chunk.byteOffset === 0 && chunk.byteLength === chunk.buffer.byteLength) return chunk;
+  return chunk.slice();
+}
+
+function createPortDownloadWriter(port, readyPromise) {
+  let pendingAck = null;
+  let closed = false;
+  let cancelled = false;
+
+  port.onmessage = (event) => {
+    const data = event.data || {};
+    if (data.type === 'ack' && pendingAck) {
+      pendingAck.resolve();
+      pendingAck = null;
+      return;
+    }
+    if (data.type === 'cancel') {
+      cancelled = true;
+      if (pendingAck) {
+        pendingAck.reject(new Error('浏览器已取消下载'));
+        pendingAck = null;
+      }
+      return;
+    }
+    if ((data.type === 'error' || data.type === 'timeout') && pendingAck) {
+      pendingAck.reject(new Error(data.error || '浏览器下载通道失败'));
+      pendingAck = null;
+    }
+  };
+
+  return {
+    mode: 'browser',
+    async write(chunk) {
+      await readyPromise;
+      if (closed) throw new Error('下载已关闭');
+      if (cancelled) throw new Error('浏览器已取消下载');
+      if (pendingAck) throw new Error('下载写入仍在进行');
+      const bytes = transferableChunk(chunk);
+      await new Promise((resolve, reject) => {
+        pendingAck = { resolve, reject };
+        port.postMessage({ type: 'chunk', chunk: bytes.buffer }, [bytes.buffer]);
+      });
+    },
+    async close() {
+      await readyPromise;
+      closed = true;
+      port.postMessage({ type: 'close' });
+    },
+    async abort() {
+      closed = true;
+      try { port.postMessage({ type: 'abort' }); } catch {}
+    },
+  };
+}
+
+function createDownloadChannel() {
+  const id = window.crypto.randomUUID ? window.crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const channel = new MessageChannel();
+  let initializedResolve;
+  let initializedReject;
+  let readyResolve;
+  let readyReject;
+  const initializedPromise = new Promise((resolve, reject) => {
+    initializedResolve = resolve;
+    initializedReject = reject;
+  });
+  const readyPromise = new Promise((resolve, reject) => {
+    readyResolve = resolve;
+    readyReject = reject;
+  });
+  let completionResolve;
+  let completionReject;
+  const completionPromise = new Promise((resolve, reject) => {
+    completionResolve = resolve;
+    completionReject = reject;
+  });
+  readyPromise.catch(() => {});
+  completionPromise.catch(() => {});
+
+  function rejectDownload(data, fallback, name = 'Error') {
+    const err = new Error(data.error || fallback);
+    err.name = name;
+    if (data.status) err.status = data.status;
+    readyReject(err);
+    completionReject(err);
+  }
+
+  const timer = setTimeout(() => {
+    const err = new Error('浏览器下载通道启动超时');
+    initializedReject(err);
+    readyReject(err);
+    completionReject(err);
+  }, DOWNLOAD_READY_TIMEOUT_MS);
+
+  channel.port1.addEventListener('message', (event) => {
+    const data = event.data || {};
+    if (data.type === 'initialized') {
+      initializedResolve();
+    } else if (data.type === 'ready') {
+      clearTimeout(timer);
+      readyResolve();
+    } else if (data.type === 'closed') {
+      clearTimeout(timer);
+      readyResolve();
+      completionResolve(data);
+    } else if (data.type === 'cancel') {
+      clearTimeout(timer);
+      rejectDownload(data, '浏览器已取消下载', 'AbortError');
+    } else if (data.type === 'timeout' || data.type === 'error') {
+      clearTimeout(timer);
+      rejectDownload(data, '浏览器下载通道失败');
+    }
+  });
+  channel.port1.start();
+
+  return {
+    id,
+    port: channel.port1,
+    transferPort: channel.port2,
+    initializedPromise,
+    readyPromise,
+    completionPromise,
+  };
+}
+
+function clickBrowserDownload(id, filename) {
+  const url = `${DOWNLOAD_SW_PREFIX}${encodeURIComponent(id)}/${encodeURIComponent(filename)}`;
+  const a = document.createElement('a');
+  a.href = url;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => a.remove(), 1000);
+}
+
+async function openBrowserManagedDownload(filename, size) {
+  const worker = requireDownloadServiceWorkerController();
+  const channel = createDownloadChannel();
+  worker.postMessage({
+    type: 'cloudsyncd-download-init',
+    id: channel.id,
+    filename,
+    size,
+  }, [channel.transferPort]);
+
+  clickBrowserDownload(channel.id, filename);
+  const writer = createPortDownloadWriter(channel.port, channel.readyPromise);
+  await channel.initializedPromise;
+  await channel.readyPromise;
+  return writer;
+}
+
+async function openWorkerManagedChunkedDownload(filename, size, transfer = {}) {
+  if (!encryptionKey || !deviceId) throw new Error('当前设备尚未完成配对');
+  if (!transfer.apiPath || !transfer.relPath) throw new Error('下载任务缺少分块路径');
+  const worker = await ensureDownloadServiceWorker();
+  const channel = createDownloadChannel();
+  worker.postMessage({
+    type: 'cloudsyncd-download-init',
+    source: 'chunked-fetch',
+    id: channel.id,
+    filename,
+    size,
+    apiPath: transfer.apiPath,
+    relPath: transfer.relPath,
+    keyHex: buf2hex(encryptionKey),
+    deviceId,
+  }, [channel.transferPort]);
+
+  clickBrowserDownload(channel.id, filename);
+  await channel.initializedPromise;
+  await channel.readyPromise;
+  return {
+    mode: 'browser',
+    ownsTransfer: true,
+    completion: channel.completionPromise,
+    async abort() {
+      try { channel.port.postMessage({ type: 'abort' }); } catch {}
+    },
+  };
+}
+
+async function openChunkedDownloadSink(filename, size, transfer = {}) {
+  if (canStreamToDisk() && wantsFilesystemDownload()) {
+    return openWritableDownload(filename);
+  }
+
+  if (downloadStreamSupported()) {
+    try {
+      return await openWorkerManagedChunkedDownload(filename, size, transfer);
+    } catch (err) {
+      console.warn('Background browser download unavailable:', err);
+      if (wantsBrowserManagedDownload()) {
+        throw new Error(`浏览器后台下载通道未就绪：${err.message}。请刷新页面后重试，或设置 cloudsyncd-download-mode=filesystem 使用文件选择器流式保存`);
+      }
+    }
+  }
+
+  if (canStreamToDisk()) {
+    return openWritableDownload(filename);
+  }
+
+  throw new Error('当前浏览器无法安全流式保存大文件。请使用支持 File System Access 的 Chrome/Edge，或使用 cloudsyncd client get 下载');
 }
 
 function assertChunkedDownloadComplete(finalManifest, total) {
@@ -295,24 +717,24 @@ function assertChunkedDownloadComplete(finalManifest, total) {
   }
 }
 
-async function saveChunkedDownloadResponse(res, filename, writable, relPath) {
+async function saveChunkedDownloadResponse(res, filename, sink, relPath) {
   let total = 0;
   let finalManifest = null;
   const onFinalManifest = (manifest) => {
     finalManifest = manifest;
   };
 
-  if (writable) {
+  if (sink) {
     try {
       for await (const chunk of decryptChunkedDownloadResponse(res, relPath, onFinalManifest)) {
-        await writable.write(chunk);
+        await sink.write(chunk);
         total += chunk.length;
       }
       assertChunkedDownloadComplete(finalManifest, total);
-      await writable.close();
-      return { bytes: total, streamedToDisk: true };
+      await sink.close();
+      return { bytes: total, mode: sink.mode || 'stream' };
     } catch (err) {
-      try { await writable.abort(); } catch {}
+      try { await sink.abort(); } catch {}
       throw err;
     }
   }
@@ -324,7 +746,7 @@ async function saveChunkedDownloadResponse(res, filename, writable, relPath) {
   }
   assertChunkedDownloadComplete(finalManifest, total);
   saveByteChunks(filename, chunks);
-  return { bytes: total, streamedToDisk: false };
+  return { bytes: total, mode: 'blob' };
 }
 
 async function sha256Hex(data) {
@@ -380,6 +802,8 @@ function toast(msg, type = 'info') {
   const container = document.getElementById('toasts');
   const el = document.createElement('div');
   el.className = `toast ${type}`;
+  el.setAttribute('role', type === 'err' ? 'alert' : 'status');
+  el.setAttribute('aria-live', type === 'err' ? 'assertive' : 'polite');
   el.textContent = msg;
   container.appendChild(el);
   setTimeout(() => el.remove(), 3000);
@@ -559,21 +983,115 @@ function formatSize(bytes) {
   return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 }
 
+function formatModifiedTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  const now = new Date();
+  const sameYear = date.getFullYear() === now.getFullYear();
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: sameYear ? undefined : 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(date);
+}
+
 function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str;
   return div.innerHTML;
 }
 
+function fileIconClass(filename) {
+  const ext = (filename.split('.').pop() || '').toLowerCase();
+  if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext)) return 'image';
+  if (['mp4', 'mov', 'mkv', 'mp3', 'wav', 'flac'].includes(ext)) return 'media';
+  if (['zip', 'tar', 'gz', 'tgz', '7z', 'rar'].includes(ext)) return 'archive';
+  return 'generic';
+}
+
+function fileIconSvg(filename) {
+  const kind = fileIconClass(filename);
+  if (kind === 'archive') {
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8v11a2 2 0 01-2 2H5a2 2 0 01-2-2V8"></path><path d="M3 8l2-5h14l2 5"></path><path d="M12 3v18"></path><path d="M9 7h6"></path></svg>';
+  }
+  if (kind === 'image' || kind === 'media') {
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><path d="M21 15l-5-5L5 21"></path></svg>';
+  }
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"></path><path d="M14 2v6h6"></path></svg>';
+}
+
+function emptyStateHtml(title, hint) {
+  return `<li class="empty-state"><div class="empty-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"></path></svg></div>${escapeHtml(title)}<span class="empty-hint">${escapeHtml(hint)}</span></li>`;
+}
+
 const PAGE_SIZE = 100;
 let allEntries = [];
 let currentPage = 0;
 let isLoading = false;
+let fileFilterQuery = '';
+
+function normalizeSearch(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function fileOnly(entries = allEntries) {
+  return entries.filter(entry => entry.type === 'file');
+}
+
+function getVisibleEntries() {
+  if (!fileFilterQuery) return allEntries;
+  const includeNames = new Set();
+  for (const entry of allEntries) {
+    const name = entry.name || '';
+    if (!name.toLowerCase().includes(fileFilterQuery)) continue;
+    includeNames.add(name);
+    const parts = name.split('/');
+    let parent = '';
+    for (let i = 0; i < parts.length - 1; i += 1) {
+      parent = parent ? `${parent}/${parts[i]}` : parts[i];
+      includeNames.add(parent);
+    }
+  }
+  return allEntries.filter(entry => includeNames.has(entry.name));
+}
+
+function updateFileSummary(entries = getVisibleEntries()) {
+  const el = document.getElementById('file-count-summary');
+  if (!el) return;
+  const total = fileOnly().length;
+  const visible = fileOnly(entries).length;
+  if (total === 0) {
+    el.textContent = '0 个文件';
+  } else if (fileFilterQuery) {
+    el.textContent = `显示 ${visible}/${total}`;
+  } else {
+    el.textContent = `${total} 个文件`;
+  }
+}
+
+function pruneSelectionToKnownFiles() {
+  const knownFiles = new Set(fileOnly().map(entry => entry.name));
+  for (const name of Array.from(selectedFiles)) {
+    if (!knownFiles.has(name)) selectedFiles.delete(name);
+  }
+}
+
+function syncRenderedSelection() {
+  document.querySelectorAll('.file-item:not(.dir-item)').forEach(li => {
+    const selected = !!li.dataset.name && selectedFiles.has(li.dataset.name);
+    li.classList.toggle('selected', selected);
+    const checkbox = li.querySelector('.file-checkbox');
+    if (checkbox) checkbox.checked = selected;
+  });
+  updateSelectionUI();
+}
 
 async function loadFiles() {
   const listEl = document.getElementById('file-list');
   const btn = document.getElementById('refresh-files-btn');
-  const previousSelection = selectionMode ? Array.from(selectedFiles) : [];
 
   if (btn) { btn.classList.add('spinning'); setTimeout(() => btn.classList.remove('spinning'), 600); }
 
@@ -589,44 +1107,51 @@ async function loadFiles() {
     const plainBuf = await Crypto.decrypt(encryptionKey, encrypted.iv, encrypted.ciphertext, encrypted.tag);
     allEntries = JSON.parse(new TextDecoder().decode(plainBuf));
     currentPage = 0;
+    pruneSelectionToKnownFiles();
 
     teardownScrollLoader();
     listEl.innerHTML = '';
     if (allEntries.length === 0) {
-      listEl.innerHTML = '<li class="empty-state"><div class="empty-icon">📁</div>暂无共享文件<br><span style="font-size:0.72rem;color:var(--text-3)">将文件放入 shared/ 目录即可</span></li>';
+      updateFileSummary([]);
+      listEl.innerHTML = emptyStateHtml('暂无共享文件', '分享端添加文件后会自动出现在这里');
       return;
     }
 
-    renderNextPage();
-
-    // Re-apply selection after render
-    if (previousSelection.length > 0) {
-      reapplySelection(previousSelection);
-    }
-
-    if (allEntries.length > PAGE_SIZE) {
-      setupScrollLoader(listEl);
-    }
+    renderCurrentFileList();
   } catch (err) {
-    listEl.innerHTML = `<li class="loading" style="color:var(--error)">${escapeHtml(err.message)}</li>`;
+    listEl.innerHTML = `<li class="loading error-state">${escapeHtml(err.message)}</li>`;
   }
 }
 
-function reapplySelection(previousSelection) {
-  const items = document.querySelectorAll('.file-item');
-  items.forEach(li => {
-    if (li.dataset.name && previousSelection.includes(li.dataset.name)) {
-      selectedFiles.add(li.dataset.name);
-      li.classList.add('selected');
-      const checkbox = li.querySelector('.file-checkbox');
-      if (checkbox) checkbox.checked = true;
-    }
-  });
-  updateSelectionUI();
+function renderCurrentFileList() {
+  const listEl = document.getElementById('file-list');
+  const entries = getVisibleEntries();
+  currentPage = 0;
+  isLoading = false;
+  teardownScrollLoader();
+  listEl.innerHTML = '';
+  updateFileSummary(entries);
+
+  if (allEntries.length === 0) {
+    listEl.innerHTML = emptyStateHtml('暂无共享文件', '分享端添加文件后会自动出现在这里');
+    return;
+  }
+
+  if (entries.length === 0) {
+    listEl.innerHTML = emptyStateHtml('没有匹配文件', '换一个关键词，或清空搜索条件');
+    syncRenderedSelection();
+    return;
+  }
+
+  renderNextPage();
+  syncRenderedSelection();
+
+  if (entries.length > PAGE_SIZE) setupScrollLoader(listEl);
 }
 
 function renderNextPage() {
-  if (isLoading || currentPage * PAGE_SIZE >= allEntries.length) return;
+  const entries = getVisibleEntries();
+  if (isLoading || currentPage * PAGE_SIZE >= entries.length) return;
   isLoading = true;
 
   const listEl = document.getElementById('file-list');
@@ -634,37 +1159,45 @@ function renderNextPage() {
   if (loadMoreEl) loadMoreEl.remove();
 
   const start = currentPage * PAGE_SIZE;
-  const end = Math.min(start + PAGE_SIZE, allEntries.length);
+  const end = Math.min(start + PAGE_SIZE, entries.length);
 
   // Use DocumentFragment for better performance with large lists
   const fragment = document.createDocumentFragment();
 
   for (let i = start; i < end; i++) {
-    const entry = allEntries[i];
+    const entry = entries[i];
     const depth = (entry.name.match(/\//g) || []).length;
     const indent = Math.min(depth, 3);
     const baseName = entry.name.split('/').pop();
     const li = document.createElement('li');
-    const checkboxId = `file-${i}`;
+    const checkboxId = `file-${start}-${i}`;
 
     if (entry.type === 'dir') {
       li.className = `file-item dir-item indent-${indent}`;
       li.dataset.dir = entry.name;
-      li.innerHTML = `<div class="dir-name"><svg class="dir-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>${escapeHtml(baseName)}</div>`;
+      li.tabIndex = 0;
+      li.setAttribute('role', 'button');
+      li.setAttribute('aria-expanded', 'true');
+      li.setAttribute('aria-label', `展开或收起目录 ${baseName}`);
+      li.innerHTML = `<div class="dir-name"><svg class="dir-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg><svg class="dir-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>${escapeHtml(baseName)}</div>`;
       li.addEventListener('click', () => toggleDir(li, entry.name));
     } else {
       li.className = `file-item indent-${indent}`;
       li.dataset.name = entry.name;
+      li.tabIndex = 0;
+      li.setAttribute('role', 'button');
+      li.setAttribute('aria-label', `下载 ${baseName}，${formatSize(entry.size)}`);
       // Add checkbox for selection mode
       li.innerHTML = `<input type="checkbox" class="file-checkbox" id="${checkboxId}">
         <label for="${checkboxId}" class="file-checkbox-label">
           <svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg>
         </label>
+        <span class="file-icon ${fileIconClass(baseName)}" aria-hidden="true">${fileIconSvg(baseName)}</span>
         <div class="file-content-wrapper">
           <div class="file-name">${escapeHtml(baseName)}</div>
-          <div class="file-meta">${formatSize(entry.size)} · ${new Date(entry.modified).toLocaleString()}</div>
+          <div class="file-meta">${formatSize(entry.size)} · ${formatModifiedTime(entry.modified)}</div>
         </div>
-        <span class="file-dl">下载</span>`;
+        <span class="file-dl" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"></path><path d="M7 10l5 5 5-5"></path><path d="M12 15V3"></path></svg><span class="file-dl-label">下载</span></span>`;
     }
     fragment.appendChild(li);
   }
@@ -673,20 +1206,22 @@ function renderNextPage() {
 
   currentPage++;
 
-  if (end < allEntries.length) {
+  if (end < entries.length) {
     const loadMoreLi = document.createElement('li');
     loadMoreLi.className = 'loading load-more';
-    loadMoreLi.textContent = `已加载 ${end}/${allEntries.length}，点击或滚动加载更多`;
+    loadMoreLi.textContent = `已加载 ${end}/${entries.length}，点击或滚动加载更多`;
     loadMoreLi.style.cursor = 'pointer';
     loadMoreLi.onclick = () => { isLoading = false; renderNextPage(); };
     listEl.appendChild(loadMoreLi);
   }
 
   isLoading = false;
+  syncRenderedSelection();
 }
 
 function toggleDir(dirLi, dirName) {
   const collapsed = dirLi.classList.toggle('collapsed');
+  dirLi.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
   const listEl = document.getElementById('file-list');
   const prefix = dirName + '/';
   let sibling = dirLi.nextElementSibling;
@@ -729,9 +1264,11 @@ function teardownScrollLoader() {
 
 async function downloadFile(name, li) {
   if (li.classList.contains('downloading')) return;
-  let writable = null;
+  let sink = null;
+  let completed = false;
+  clearFileDownloadComplete(li);
   li.classList.add('downloading');
-  li.querySelector('.file-dl').textContent = '解密中...';
+  setFileDownloadText(li, '解密中...');
 
   try {
     // Encode each path segment separately to preserve slashes
@@ -739,11 +1276,12 @@ async function downloadFile(name, li) {
     const entry = allEntries.find(item => item.type === 'file' && item.name === name);
     const baseName = name.split('/').pop() || 'download.bin';
     const useChunkedDownload = entry && entry.size >= LARGE_FILE_STREAM_THRESHOLD && window.ReadableStream;
+    const endpoint = useChunkedDownload ? `/api/files-chunked/${encodedPath}` : `/api/files/${encodedPath}`;
 
-    if (useChunkedDownload && canStreamToDisk()) {
-      li.querySelector('.file-dl').textContent = '保存中...';
+    if (useChunkedDownload) {
+      setFileDownloadText(li, '准备下载...');
       try {
-        writable = await openWritableDownload(baseName);
+        sink = await openChunkedDownloadSink(baseName, entry.size, { apiPath: endpoint, relPath: name });
       } catch (err) {
         if (err && err.name === 'AbortError') {
           toast('已取消下载', 'info');
@@ -751,15 +1289,23 @@ async function downloadFile(name, li) {
         }
         throw err;
       }
-      li.querySelector('.file-dl').textContent = '解密中...';
+      if (sink && sink.ownsTransfer) {
+        setFileDownloadText(li, '浏览器下载中...');
+        await sink.completion;
+        sink = null;
+        completed = true;
+        markFileDownloadComplete(li);
+        toast(`下载完成：${baseName}`, 'ok');
+        return;
+      }
+      setFileDownloadText(li, '解密中...');
     }
 
-    const endpoint = useChunkedDownload ? `/api/files-chunked/${encodedPath}` : `/api/files/${encodedPath}`;
     const res = await apiFetch(endpoint);
     if (res.status === 401 || res.status === 403) {
-      if (writable) {
-        try { await writable.abort(); } catch {}
-        writable = null;
+      if (sink) {
+        try { await sink.abort(); } catch {}
+        sink = null;
       }
       await resetToPairing('配对已失效，请在服务端生成新 PIN 后重新配对');
       return;
@@ -768,23 +1314,64 @@ async function downloadFile(name, li) {
 
     if (useChunkedDownload) {
       const filename = safeDecodeHeader(res.headers.get('x-file-name')) || baseName;
-      const result = await saveChunkedDownloadResponse(res, filename, writable, name);
-      writable = null;
-      toast(`${baseName} 下载完成${result.streamedToDisk ? '' : '（内存回退）'}`, 'ok');
+      const result = await saveChunkedDownloadResponse(res, filename, sink, name);
+      sink = null;
+      const suffix = result.mode === 'blob' ? '（内存回退）' : '';
+      completed = true;
+      markFileDownloadComplete(li);
+      toast(`下载完成：${baseName}${suffix}`, 'ok');
     } else {
       const { filename, plainBuf } = await decryptDownloadResponse(res);
       saveBytes(filename || baseName, plainBuf);
-      toast(`${baseName} 下载完成`, 'ok');
+      completed = true;
+      markFileDownloadComplete(li);
+      toast(`下载完成：${baseName}`, 'ok');
     }
   } catch (err) {
-    if (writable) {
-      try { await writable.abort(); } catch {}
+    if (sink) {
+      try { await sink.abort(); } catch {}
+    }
+    if (err && err.name === 'AbortError') {
+      toast('已取消下载', 'info');
+      return;
+    }
+    if (err && (err.status === 401 || err.status === 403)) {
+      await resetToPairing('配对已失效，请在服务端生成新 PIN 后重新配对');
+      return;
     }
     toast('下载失败: ' + err.message, 'err');
   } finally {
     li.classList.remove('downloading');
-    li.querySelector('.file-dl').textContent = '下载';
+    if (!completed) setFileDownloadText(li, '下载');
   }
+}
+
+function setFileDownloadText(li, text) {
+  const label = li.querySelector('.file-dl-label') || li.querySelector('.file-dl');
+  if (label) label.textContent = text;
+}
+
+const fileDownloadCompleteTimers = new WeakMap();
+
+function clearFileDownloadComplete(li) {
+  const timer = fileDownloadCompleteTimers.get(li);
+  if (timer) clearTimeout(timer);
+  fileDownloadCompleteTimers.delete(li);
+  li.classList.remove('download-complete');
+}
+
+function markFileDownloadComplete(li) {
+  clearFileDownloadComplete(li);
+  li.classList.add('download-complete');
+  setFileDownloadText(li, '已完成');
+  const timer = setTimeout(() => {
+    fileDownloadCompleteTimers.delete(li);
+    if (!li.classList.contains('downloading')) {
+      li.classList.remove('download-complete');
+      setFileDownloadText(li, '下载');
+    }
+  }, DOWNLOAD_COMPLETE_HOLD_MS);
+  fileDownloadCompleteTimers.set(li, timer);
 }
 
 // ============ PIN Input ============
@@ -853,11 +1440,13 @@ const clearSelectionBtn = document.getElementById('clear-selection-btn');
 function updateSelectionUI() {
   const count = selectedFiles.size;
   selectionCountEl.textContent = count;
-  batchDownloadBtn.disabled = count === 0;
+  const batchBusy = batchDownloadBtn.dataset.busy === '1';
+  batchDownloadBtn.disabled = batchBusy || count === 0;
 
-  // Update top bar selection count only (don't toggle visibility)
   if (selectionMode && topSelectionBar) {
-    document.getElementById('top-selection-text').textContent = `已选择 ${count} 项`;
+    const visibleSelected = document.querySelectorAll('.file-item.selected:not(.dir-item)').length;
+    const suffix = visibleSelected === count ? '' : `，当前显示 ${visibleSelected} 项`;
+    document.getElementById('top-selection-text').textContent = `已选择 ${count} 项${suffix}`;
   }
 }
 
@@ -877,7 +1466,13 @@ function toggleSelection(fileList, name, li) {
 }
 
 function toggleSelectionMode() {
-  selectionMode = !selectionMode;
+  setSelectionMode(!selectionMode, { clear: selectionMode });
+}
+
+function setSelectionMode(enabled, options = {}) {
+  if (enabled) clearBatchDownloadComplete();
+  selectionMode = enabled;
+  document.body.classList.toggle('selection-active', selectionMode);
   const listEl = document.getElementById('file-list');
 
   if (selectionMode) {
@@ -885,107 +1480,292 @@ function toggleSelectionMode() {
     toggleSelectionModeBtn.textContent = '完成';
     topSelectionBar.classList.add('active');
     selectionBar.classList.add('active');
-    // Update text based on current selection
-    document.getElementById('top-selection-text').textContent = `已选择 ${selectedFiles.size} 项`;
   } else {
     listEl.classList.remove('selection-mode');
-    selectedFiles.clear();
+    if (options.clear) selectedFiles.clear();
     toggleSelectionModeBtn.textContent = '选择';
     selectionBar.classList.remove('active');
     topSelectionBar.classList.remove('active');
-    selectionCountEl.textContent = '0';
     document.getElementById('top-selection-text').textContent = '选择文件';
   }
+  syncRenderedSelection();
 }
 
 function selectAllFiles() {
-  // Only select files (not directories) that are currently loaded
+  // Select only files that are currently rendered, respecting search and pagination.
   const loadedItems = document.querySelectorAll('.file-item:not(.dir-item)');
   loadedItems.forEach(li => {
     if (li.dataset.name) {
       selectedFiles.add(li.dataset.name);
-      li.classList.add('selected');
-      const checkbox = li.querySelector('.file-checkbox');
-      if (checkbox) checkbox.checked = true;
     }
   });
-  updateSelectionUI();
+  syncRenderedSelection();
 }
 
 function clearSelection() {
   selectedFiles.clear();
-  document.querySelectorAll('.file-item.selected').forEach(li => {
-    li.classList.remove('selected');
-    const checkbox = li.querySelector('.file-checkbox');
-    if (checkbox) checkbox.checked = false;
-  });
+  syncRenderedSelection();
+}
+
+// ============ ZIP archive writer (STORE method, streamed to disk) ============
+
+const ZIP_MAX_FILE_BYTES = 256 * 1024 * 1024; // skip files larger than this in a batch
+
+const ZIP_CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32Update(buf, crc) {
+  let c = (crc ^ 0xFFFFFFFF) >>> 0;
+  for (let i = 0; i < buf.length; i++) c = (c >>> 8) ^ ZIP_CRC_TABLE[(c ^ buf[i]) & 0xFF];
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+const zipU16 = (n) => new Uint8Array([n & 0xff, (n >>> 8) & 0xff]);
+const zipU32 = (n) => new Uint8Array([n & 0xff, (n >>> 8) & 0xff, (n >>> 16) & 0xff, (n >>> 24) & 0xff]);
+function zipBytes(...parts) {
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return out;
+}
+
+// Writes a streaming zip to `sink` (SW port writer / file picker / blob fallback).
+function createZipWriter(sink) {
+  const encoder = new TextEncoder();
+  const centralEntries = [];
+  let offset = 0;
+
+  async function write(bytes) { await sink.write(bytes); offset += bytes.length; }
+
+  async function addFile(name, data) {
+    const nameBytes = encoder.encode(name);
+    const crc = crc32Update(data, 0);
+    const size = data.length;
+    const startOffset = offset;
+    const localHeader = zipBytes(
+      new Uint8Array([0x50, 0x4b, 0x03, 0x04]),
+      zipU16(20), zipU16(0), zipU16(0),
+      zipU16(0), zipU16(0),
+      zipU32(crc), zipU32(size), zipU32(size),
+      zipU16(nameBytes.length), zipU16(0),
+      nameBytes
+    );
+    await write(localHeader);
+    const CHUNK = 8 * 1024 * 1024;
+    for (let i = 0; i < data.length; i += CHUNK) {
+      await write(data.subarray(i, Math.min(i + CHUNK, data.length)));
+    }
+    centralEntries.push({ nameBytes, crc, size, offset: startOffset });
+  }
+
+  async function finalize() {
+    const cdStart = offset;
+    for (const e of centralEntries) {
+      const cd = zipBytes(
+        new Uint8Array([0x50, 0x4b, 0x01, 0x02]),
+        zipU16(20), zipU16(20), zipU16(0), zipU16(0),
+        zipU16(0), zipU16(0),
+        zipU32(e.crc), zipU32(e.size), zipU32(e.size),
+        zipU16(e.nameBytes.length), zipU16(0), zipU16(0),
+        zipU16(0), zipU16(0), zipU32(0),
+        zipU32(e.offset), e.nameBytes
+      );
+      await write(cd);
+    }
+    const eocd = zipBytes(
+      new Uint8Array([0x50, 0x4b, 0x05, 0x06]),
+      zipU16(0), zipU16(0),
+      zipU16(centralEntries.length), zipU16(centralEntries.length),
+      zipU32(offset - cdStart), zipU32(cdStart),
+      zipU16(0)
+    );
+    await write(eocd);
+  }
+
+  return { addFile, finalize };
+}
+
+function createBlobZipSink(filename) {
+  const chunks = [];
+  return {
+    mode: 'blob',
+    async write(chunk) { chunks.push(chunk); },
+    async close() { saveByteChunks(filename, chunks); },
+    async abort() { chunks.length = 0; },
+  };
+}
+
+async function openZipSink(filename, estimatedBytes = 0) {
+  if (canStreamToDisk() && !wantsBrowserManagedDownload()) {
+    return openWritableDownload(filename);
+  }
+
+  if (wantsBrowserManagedDownload()) {
+    if (downloadStreamSupported()) {
+      try { return await openBrowserManagedDownload(filename, null); }
+      catch (err) { console.warn('SW zip sink unavailable:', err); }
+    }
+    if (estimatedBytes > BLOB_DOWNLOAD_FALLBACK_MAX_BYTES) {
+      throw new Error('浏览器下载管理器通道未就绪，批量文件过大，无法安全使用内存回退；请刷新页面后重试，或清除 cloudsyncd-download-mode 后使用文件选择器流式保存');
+    }
+  }
+
+  if (estimatedBytes > BLOB_DOWNLOAD_FALLBACK_MAX_BYTES) {
+    throw new Error('当前浏览器无法安全流式保存大批量文件。请使用支持 File System Access 的 Chrome/Edge，或使用 cloudsyncd client get 下载');
+  }
+  return createBlobZipSink(filename);
+}
+
+async function collectFileBytes(fileName, entry) {
+  const encodedPath = fileName.split('/').map(encodeURIComponent).join('/');
+  const useChunked = entry && entry.size >= LARGE_FILE_STREAM_THRESHOLD && window.ReadableStream;
+  const endpoint = useChunked ? `/api/files-chunked/${encodedPath}` : `/api/files/${encodedPath}`;
+  const res = await apiFetch(endpoint);
+  if (res.status === 401 || res.status === 403) {
+    await resetToPairing('配对已失效，请在服务端生成新 PIN 后重新配对');
+    throw new Error('配对已失效');
+  }
+  if (!res.ok) throw new Error(await getErrorMessage(res, 'Download failed'));
+  if (useChunked) {
+    const chunks = [];
+    let total = 0;
+    let finalManifest = null;
+    for await (const c of decryptChunkedDownloadResponse(res, fileName, (manifest) => { finalManifest = manifest; })) {
+      chunks.push(c);
+      total += c.length;
+    }
+    assertChunkedDownloadComplete(finalManifest, total);
+    const merged = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) { merged.set(c, off); off += c.length; }
+    return merged;
+  }
+  const { plainBuf } = await decryptDownloadResponse(res);
+  return plainBuf;
+}
+
+function setBatchBusy(busy, text) {
+  if (!batchDownloadBtn) return;
+  if (busy) clearBatchDownloadComplete();
+  batchDownloadBtn.dataset.busy = busy ? '1' : '0';
+  batchDownloadBtn.textContent = text || '批量下载';
   updateSelectionUI();
 }
 
+let batchDownloadCompleteTimer = null;
+
+function clearBatchDownloadComplete() {
+  if (!batchDownloadBtn) return;
+  if (batchDownloadCompleteTimer) {
+    clearTimeout(batchDownloadCompleteTimer);
+    batchDownloadCompleteTimer = null;
+  }
+  batchDownloadBtn.classList.remove('download-complete');
+}
+
+function markBatchDownloadComplete() {
+  if (!batchDownloadBtn) return;
+  clearBatchDownloadComplete();
+  batchDownloadBtn.dataset.busy = '1';
+  batchDownloadBtn.classList.add('download-complete');
+  batchDownloadBtn.textContent = '已完成';
+  updateSelectionUI();
+  batchDownloadCompleteTimer = setTimeout(() => {
+    batchDownloadCompleteTimer = null;
+    if (selectionMode) setSelectionMode(false, { clear: true });
+    batchDownloadBtn.classList.remove('download-complete');
+    setBatchBusy(false);
+  }, DOWNLOAD_COMPLETE_HOLD_MS);
+}
+
+// Batch download = ONE zip archive (not N separate downloads). Streams to disk
+// when available; skips failed / oversized files instead of aborting the whole
+// batch.
 async function batchDownload() {
   if (selectedFiles.size === 0) return;
+  const fileNames = Array.from(selectedFiles);
+  const total = fileNames.length;
+  const zipName = `cloudsyncd-files-${total}.zip`;
+  const estimatedBytes = fileNames.reduce((sum, fileName) => {
+    const entry = allEntries.find(it => it.type === 'file' && it.name === fileName);
+    if (!entry || entry.size > ZIP_MAX_FILE_BYTES) return sum;
+    return sum + entry.size;
+  }, 0);
 
-  // Check if selection is too large
-  if (selectedFiles.size > 50) {
-    toast('批量下载最多选择 50 个文件', 'err');
-    return;
-  }
+  setBatchBusy(true, `打包中 0/${total}`);
+  let sink = null;
+  const failed = [];
+  const skipped = [];
+  let done = 0;
+  let completed = false;
 
-  let downloadedCount = 0;
-  const totalCount = selectedFiles.size;
+  try {
+    sink = await openZipSink(zipName, estimatedBytes);
+    const zip = createZipWriter(sink);
 
-  for (const fileName of selectedFiles) {
-    const listEl = document.getElementById('file-list');
-    const li = Array.from(listEl.querySelectorAll('.file-item')).find(
-      item => item.dataset.name === fileName
-    );
-
-    if (li) {
-      li.classList.add('downloading');
-      const dlSpan = li.querySelector('.file-dl') || li.querySelector('.file-name');
-      if (dlSpan) dlSpan.textContent = '下载中...';
-    }
-
-    try {
-      const encodedPath = fileName.split('/').map(encodeURIComponent).join('/');
-      const entry = allEntries.find(item => item.type === 'file' && item.name === fileName);
-      const useChunkedDownload = entry && entry.size >= LARGE_FILE_STREAM_THRESHOLD && window.ReadableStream;
-      const endpoint = useChunkedDownload ? `/api/files-chunked/${encodedPath}` : `/api/files/${encodedPath}`;
-      const res = await apiFetch(endpoint);
-      if (res.status === 401 || res.status === 403) {
-        await resetToPairing('配对已失效，请在服务端生成新 PIN 后重新配对');
-        return;
-      }
-      if (!res.ok) throw new Error(await getErrorMessage(res, 'Download failed'));
-      const baseName = fileName.split('/').pop() || 'download.bin';
-      if (useChunkedDownload) {
-        const filename = safeDecodeHeader(res.headers.get('x-file-name')) || baseName;
-        await saveChunkedDownloadResponse(res, filename, null, fileName);
+    for (const fileName of fileNames) {
+      const entry = allEntries.find(it => it.type === 'file' && it.name === fileName);
+      if (entry && entry.size > ZIP_MAX_FILE_BYTES) {
+        skipped.push(fileName);
       } else {
-        const { filename, plainBuf } = await decryptDownloadResponse(res);
-        saveBytes(filename || baseName, plainBuf);
+        try {
+          const data = await collectFileBytes(fileName, entry);
+          await zip.addFile(fileName, data);
+        } catch (err) {
+          if (err.message === '配对已失效') throw err;
+          console.error(`Failed to add ${fileName} to zip:`, err);
+          failed.push(fileName);
+        }
       }
-      downloadedCount++;
-    } catch (err) {
-      console.error(`Failed to download ${fileName}:`, err);
+      done += 1;
+      setBatchBusy(true, `打包中 ${done}/${total}`);
     }
 
-    if (li) {
-      li.classList.remove('downloading');
-      const dlSpan = li.querySelector('.file-dl');
-      if (dlSpan) dlSpan.textContent = '下载';
-    }
+    await zip.finalize();
+    await sink.close();
+    sink = null;
+
+    const okCount = total - failed.length - skipped.length;
+    let msg = `下载完成：${zipName}（${okCount}/${total} 个文件）`;
+    if (failed.length) msg += `，${failed.length} 个失败`;
+    if (skipped.length) msg += `，${skipped.length} 个过大已跳过`;
+    completed = true;
+    markBatchDownloadComplete();
+    toast(msg, (failed.length || skipped.length) ? 'info' : 'ok');
+  } catch (err) {
+    if (sink) { try { await sink.abort(); } catch {} }
+    if (err.message !== '配对已失效') toast('打包下载失败: ' + err.message, 'err');
+  } finally {
+    if (!completed) setBatchBusy(false);
   }
-
-  toast(`批量下载完成: ${downloadedCount}/${totalCount}`, downloadedCount === totalCount ? 'ok' : 'info');
-  clearSelection();
 }
 
 function setupEventListeners() {
+  // Theme toggle
+  const themeToggleBtn = document.getElementById('theme-toggle');
+  if (themeToggleBtn) themeToggleBtn.addEventListener('click', toggleTheme);
+
   // Refresh files button (was an inline onclick; moved here so CSP script-src
   // 'self' can be enforced without 'unsafe-inline').
   const refreshBtn = document.getElementById('refresh-files-btn');
   if (refreshBtn) refreshBtn.addEventListener('click', loadFiles);
+
+  const fileSearchInput = document.getElementById('file-search-input');
+  if (fileSearchInput) {
+    fileSearchInput.addEventListener('input', () => {
+      fileFilterQuery = normalizeSearch(fileSearchInput.value);
+      renderCurrentFileList();
+    });
+  }
 
   // Toggle selection mode button
   if (toggleSelectionModeBtn) {
@@ -994,13 +1774,7 @@ function setupEventListeners() {
 
   // Close top selection bar
   if (closeTopSelectionBtn) {
-    closeTopSelectionBtn.addEventListener('click', () => {
-      selectionMode = false;
-      document.getElementById('file-list').classList.remove('selection-mode');
-      topSelectionBar.classList.remove('active');
-      selectionBar.classList.remove('active');
-      updateSelectionUI();
-    });
+    closeTopSelectionBtn.addEventListener('click', () => setSelectionMode(false, { clear: true }));
   }
 
   // Select all / Clear
@@ -1051,14 +1825,29 @@ function setupEventListeners() {
     downloadFile(li.dataset.name, li);
   });
 
+  document.getElementById('file-list')?.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    if (e.target.closest('.file-checkbox')) return;
+    const li = e.target.closest('.file-item');
+    if (!li) return;
+    e.preventDefault();
+    if (li.dataset.dir) {
+      toggleDir(li, li.dataset.dir);
+      return;
+    }
+    if (!li.dataset.name) return;
+    if (selectionMode) {
+      toggleSelection(null, li.dataset.name, li);
+    } else {
+      downloadFile(li.dataset.name, li);
+    }
+  });
+
   // Bottom action bar click close
   if (selectionBar) {
     selectionBar.addEventListener('click', (e) => {
       if (e.target === selectionBar) {
-        selectionMode = false;
-        document.getElementById('file-list').classList.remove('selection-mode');
-        selectionBar.classList.remove('active');
-        updateSelectionUI();
+        setSelectionMode(false, { clear: true });
       }
     });
   }
@@ -1069,6 +1858,7 @@ function setupEventListeners() {
 async function init() {
   setupPinInputs();
   setupEventListeners();
+  warmDownloadServiceWorker();
 
   const storedKey = await KeyStore.get('encryptionKey');
   const storedDeviceId = await KeyStore.get('deviceId');

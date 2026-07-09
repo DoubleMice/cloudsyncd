@@ -5,8 +5,11 @@
 
 const fs = require('fs');
 const path = require('path');
+const { formatSize } = require('./lib/format');
 
-const sharedDir = path.join(__dirname, 'shared');
+const sharedDir = process.env.CLOUDSYNCD_SHARED_DIR
+  ? path.resolve(process.env.CLOUDSYNCD_SHARED_DIR)
+  : path.join(__dirname, 'shared');
 const args = process.argv.slice(2);
 const forceCopy = args.includes('--copy');
 
@@ -58,7 +61,14 @@ fs.mkdirSync(sharedDir, { recursive: true });
 // Place a single file at dest. Prefers a hard link (zero space, same inode);
 // copies on failure (EXDEV = cross-filesystem). Returns 'link' | 'copy'.
 function addFile(src, dest) {
-  if (fs.existsSync(dest)) fs.rmSync(dest, { force: true });
+  if (fs.existsSync(dest)) {
+    const srcStat = fs.statSync(src);
+    const destStat = fs.statSync(dest);
+    if (srcStat.dev === destStat.dev && srcStat.ino === destStat.ino) {
+      return 'same';
+    }
+    fs.rmSync(dest, { force: true });
+  }
   if (forceCopy) {
     fs.copyFileSync(src, dest);
     return 'copy';
@@ -72,11 +82,16 @@ function addFile(src, dest) {
   }
 }
 
+function isPathInsideOrSame(parent, candidate) {
+  const rel = path.relative(path.resolve(parent), path.resolve(candidate));
+  return rel === '' || (!!rel && !rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
 // Recursively mirror a directory: recreate subdirs, hard-link each file
 // (per-file copy fallback). Returns { link, copy } counts.
 function addDir(src, dest) {
   fs.mkdirSync(dest, { recursive: true });
-  const counts = { link: 0, copy: 0 };
+  const counts = { link: 0, copy: 0, same: 0 };
   for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
     if (entry.name.startsWith('.')) continue;
     const s = path.join(src, entry.name);
@@ -87,8 +102,10 @@ function addDir(src, dest) {
       const sub = addDir(s, d);
       counts.link += sub.link;
       counts.copy += sub.copy;
+      counts.same += sub.same;
     } else if (st.isFile()) {
-      counts[addFile(s, d) === 'link' ? 'link' : 'copy']++;
+      const mode = addFile(s, d);
+      counts[mode === 'link' ? 'link' : mode === 'same' ? 'same' : 'copy']++;
     }
   }
   return counts;
@@ -97,6 +114,8 @@ function addDir(src, dest) {
 let fileCount = 0;
 let linked = 0;
 let copied = 0;
+let same = 0;
+let skippedDirs = 0;
 
 for (const src of args.filter((a) => a !== '--copy')) {
   const resolved = path.resolve(src);
@@ -108,23 +127,25 @@ for (const src of args.filter((a) => a !== '--copy')) {
   const stat = fs.statSync(resolved);
 
   if (stat.isDirectory()) {
+    if (isPathInsideOrSame(resolved, dest)) {
+      skippedDirs++;
+      console.error(`  跳过: ${src} (目标目录位于源目录内，避免递归复制自身)`);
+      continue;
+    }
     const c = addDir(resolved, dest);
-    fileCount += c.link + c.copy;
+    fileCount += c.link + c.copy + c.same;
     linked += c.link;
     copied += c.copy;
-    console.log(`  + ${path.basename(resolved)}/  (link ${c.link}, copy ${c.copy})`);
+    same += c.same;
+    console.log(`  + ${path.basename(resolved)}/  (link ${c.link}, copy ${c.copy}, already ${c.same})`);
   } else {
     const mode = addFile(resolved, dest);
     fileCount++;
-    if (mode === 'link') linked++; else copied++;
+    if (mode === 'link') linked++;
+    else if (mode === 'same') same++;
+    else copied++;
     console.log(`  + ${path.basename(resolved)}  [${mode}]`);
   }
 }
 
-console.log(`共加入 ${fileCount} 个文件到 shared/（硬链接 ${linked}，复制 ${copied}）`);
-
-function formatSize(n) {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / 1024 / 1024).toFixed(1)} MB`;
-}
+console.log(`共处理 ${fileCount} 个文件（硬链接 ${linked}，复制 ${copied}，已存在 ${same}，跳过目录 ${skippedDirs}）`);

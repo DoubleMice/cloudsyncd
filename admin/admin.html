@@ -6,147 +6,14 @@
   <title>cloudsyncd · 管理端</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="admin.css">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%' stop-color='%2334d399'/><stop offset='100%' stop-color='%23059669'/></linearGradient></defs><rect width='100' height='100' rx='20' fill='%230c0f16'/><path d='M50 22a28 28 0 100 56 28 28 0 000-56zm0 12a16 16 0 110 32 16 16 0 010-32z' fill='url(%23g)'/><circle cx='50' cy='50' r='6' fill='%2334d399'/></svg>">
-  <style>
-    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
-    :root {
-      --bg: #f3f5f9;
-      --surface: #ffffff;
-      --surface-hover: #f7f9fc;
-      --surface-active: #eef1f6;
-      --glass: rgba(255,255,255,0.9);
-      --accent: #059669;
-      --accent-bright: #10b981;
-      --accent-soft: rgba(5,150,105,0.10);
-      --accent-softer: rgba(5,150,105,0.06);
-      --text: #1a2330;
-      --text-2: #5b6678;
-      --text-3: #98a2b3;
-      --border: #e4e8ef;
-      --border-strong: #d4dae3;
-      --error: #dc2626;
-      --error-bg: rgba(220,38,38,0.07);
-      --error-border: rgba(220,38,38,0.22);
-      --warn: #d97706;
-      --radius: 14px;
-      --radius-sm: 10px;
-      --shadow: 0 1px 3px rgba(15,23,42,0.04), 0 1px 2px rgba(15,23,42,0.03);
-      --shadow-md: 0 4px 16px rgba(15,23,42,0.06);
-      --font: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
-      --mono: 'JetBrains Mono', 'SF Mono', monospace;
-    }
-    body { font-family: var(--font); background: var(--bg); color: var(--text); min-height: 100dvh; -webkit-font-smoothing: antialiased; }
-    body::before { content: ''; position: fixed; inset: 0; background: radial-gradient(ellipse 50% 40% at 50% -5%, rgba(16,185,129,0.10), transparent), radial-gradient(ellipse 30% 50% at 90% 100%, rgba(16,185,129,0.05), transparent); pointer-events: none; z-index: 0; }
-    .container { max-width: 920px; width: 100%; margin: 0 auto; padding: 2rem; position: relative; z-index: 1; }
-    .screen { display: none; }
-    .screen.active { display: block; animation: fadeUp 0.4s cubic-bezier(0.16,1,0.3,1) forwards; }
-    @keyframes fadeUp { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
-
-    /* Login */
-    #login-screen.active { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: calc(100dvh - 4rem); text-align: center; }
-    .logo { display: flex; align-items: center; gap: 10px; margin-bottom: 0.5rem; }
-    #login-screen .logo { justify-content: center; margin-bottom: 1rem; }
-    .logo-icon { width: 38px; height: 38px; background: linear-gradient(135deg, var(--accent-bright), var(--accent)); border-radius: 10px; display: flex; align-items: center; justify-content: center; box-shadow: var(--shadow-md), inset 0 1px 0 rgba(255,255,255,0.25); }
-    .logo-icon svg { width: 19px; height: 19px; }
-    .logo-text { font-size: 1.35rem; font-weight: 700; letter-spacing: -0.03em; color: var(--text); }
-    .badge { font-size: 0.72rem; font-weight: 600; color: var(--accent); background: var(--accent-soft); border: 1px solid rgba(5,150,105,0.22); padding: 0.15rem 0.5rem; border-radius: 8px; margin-left: 8px; vertical-align: middle; }
-    .subtitle { color: var(--text-2); font-size: 0.88rem; margin-bottom: 1.75rem; line-height: 1.6; max-width: 340px; }
-    .field { width: 100%; max-width: 360px; }
-    .field label { display: block; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-2); margin-bottom: 0.5rem; }
-    input.token-input { width: 100%; padding: 0.85rem 1rem; font-family: var(--mono); font-size: 0.9rem; background: var(--surface); border: 1.5px solid var(--border-strong); border-radius: var(--radius-sm); color: var(--text); outline: none; transition: all 0.2s; caret-color: var(--accent); text-align: center; letter-spacing: 0.05em; box-shadow: var(--shadow); }
-    input.token-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-softer), var(--shadow); }
-    .hint { color: var(--text-3); font-size: 0.74rem; margin-top: 0.65rem; line-height: 1.6; }
-    .hint code { font-family: var(--mono); color: var(--text-2); background: var(--surface-active); padding: 1px 5px; border-radius: 4px; }
-
-    .btn { border: none; border-radius: var(--radius-sm); font-family: var(--font); font-size: 0.88rem; font-weight: 600; cursor: pointer; transition: all 0.2s; letter-spacing: -0.01em; }
-    .btn-primary { background: linear-gradient(135deg, var(--accent-bright), var(--accent)); color: #fff; box-shadow: 0 4px 16px rgba(5,150,105,0.18), inset 0 1px 0 rgba(255,255,255,0.2); padding: 0.85rem 1.5rem; }
-    .btn-primary:hover { box-shadow: 0 6px 24px rgba(5,150,105,0.24); transform: translateY(-1px); }
-    .btn-primary:active { transform: translateY(0); }
-    .btn-primary:disabled { background: var(--surface-active); color: var(--text-3); cursor: not-allowed; transform: none; box-shadow: none; }
-    .btn-secondary { background: var(--surface); color: var(--text-2); border: 1px solid var(--border-strong); padding: 0.5rem 0.9rem; box-shadow: var(--shadow); }
-    .btn-secondary:hover { background: var(--surface-hover); color: var(--text); border-color: var(--text-3); }
-    .btn-danger { background: var(--error-bg); color: var(--error); border: 1px solid var(--error-border); padding: 0.5rem 0.9rem; }
-    .btn-danger:hover { background: rgba(220,38,38,0.12); border-color: rgba(220,38,38,0.34); }
-    .btn-danger:disabled { opacity: 0.4; cursor: not-allowed; }
-    .btn-ghost { background: none; color: var(--text-3); border: none; padding: 0.4rem 0.6rem; font-size: 0.82rem; border-radius: 6px; }
-    .btn-ghost:hover { color: var(--text); background: var(--surface-active); }
-
-    /* Danger zone */
-    .dz-row { display: flex; flex-direction: column; gap: 0; }
-    .dz-item { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 0.85rem 0; border-bottom: 1px solid var(--border); }
-    .dz-item:last-child { border-bottom: none; }
-    .dz-text { flex: 1; min-width: 0; }
-    .dz-title { font-size: 0.86rem; font-weight: 600; color: var(--text); }
-    .dz-desc { font-size: 0.76rem; color: var(--text-2); margin-top: 3px; line-height: 1.5; }
-    .dz-item .btn { flex-shrink: 0; }
-
-    /* Header */
-    .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.75rem; }
-    .topbar .logo { margin-bottom: 0; }
-    .topbar-right { display: flex; align-items: center; gap: 0.75rem; }
-    .uptime { font-size: 0.74rem; color: var(--text-3); font-family: var(--mono); }
-
-    /* Cards */
-    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.25rem; margin-bottom: 1rem; box-shadow: var(--shadow); }
-    .card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
-    .card-title { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-3); }
-    .card-actions { display: flex; gap: 8px; }
-
-    /* Status grid */
-    .stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 1rem; }
-    .stat { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem 1.1rem; box-shadow: var(--shadow); }
-    .stat-label { font-size: 0.68rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-3); }
-    .stat-value { font-size: 1.6rem; font-weight: 700; color: var(--text); margin-top: 0.35rem; letter-spacing: -0.03em; font-family: var(--mono); }
-    .stat-sub { font-size: 0.72rem; color: var(--text-2); margin-top: 2px; }
-    .stat .ok { color: var(--accent); }
-
-    /* PIN result */
-    .pin-result { display: none; margin-top: 1rem; text-align: center; }
-    .pin-result.show { display: block; animation: fadeUp 0.3s ease; }
-    .pin-big { font-family: var(--mono); font-size: 2.6rem; font-weight: 600; letter-spacing: 0.35em; color: var(--accent); padding-left: 0.35em; }
-    .pin-note { color: var(--text-2); font-size: 0.78rem; margin-top: 0.5rem; line-height: 1.6; }
-
-    /* Table */
-    .tbl { width: 100%; border-collapse: collapse; }
-    .tbl th { text-align: left; font-size: 0.68rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-3); padding: 0.4rem 0.5rem 0.6rem; border-bottom: 1px solid var(--border); }
-    .tbl td { padding: 0.6rem 0.5rem; font-size: 0.84rem; border-bottom: 1px solid var(--border); }
-    .tbl tr:last-child td { border-bottom: none; }
-    .tbl td.mono { font-family: var(--mono); color: var(--text); word-break: break-all; }
-    .tbl td.muted { color: var(--text-2); }
-    .tbl td.right { text-align: right; }
-    .empty { text-align: center; color: var(--text-3); font-size: 0.84rem; padding: 1.5rem 1rem; }
-
-    /* File list */
-    .file-row { display: flex; align-items: center; gap: 10px; padding: 0.55rem 0.25rem; border-bottom: 1px solid var(--border); font-size: 0.84rem; }
-    .file-row:last-child { border-bottom: none; }
-    .file-row.dir { color: var(--text-2); font-weight: 600; }
-    .file-row .indent { color: var(--text-3); }
-    .file-row .name { color: var(--text); flex: 1; word-break: break-all; }
-    .file-row.dir .name { color: var(--text-2); }
-    .file-row .sz { color: var(--text-3); font-family: var(--mono); font-size: 0.76rem; white-space: nowrap; }
-    .file-icon { width: 16px; height: 16px; flex-shrink: 0; opacity: 0.45; }
-
-    /* Toast */
-    .toast-container { position: fixed; top: 1.25rem; left: 50%; transform: translateX(-50%); z-index: 999; display: flex; flex-direction: column; align-items: center; gap: 0.5rem; }
-    .toast { padding: 0.6rem 1.1rem; border-radius: 20px; font-size: 0.8rem; font-weight: 500; backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); animation: toastIn 0.3s ease, toastOut 0.3s ease 2.8s forwards; max-width: 360px; text-align: center; box-shadow: var(--shadow-md); }
-    .toast.ok { background: rgba(5,150,105,0.12); border: 1px solid rgba(5,150,105,0.24); color: var(--accent); }
-    .toast.err { background: rgba(220,38,38,0.10); border: 1px solid var(--error-border); color: var(--error); }
-    .toast.info { background: rgba(255,255,255,0.92); border: 1px solid var(--border-strong); color: var(--text-2); }
-    @keyframes toastIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
-    @keyframes toastOut { to { opacity: 0; transform: translateY(-10px); } }
-
-    @media (max-width: 720px) {
-      .container { padding: 1.25rem; }
-      .stat-grid { grid-template-columns: repeat(2, 1fr); }
-      .pin-big { font-size: 2rem; }
-    }
-  </style>
 </head>
 <body>
   <div class="toast-container" id="toasts"></div>
 
-  <!-- Login -->
   <div class="container">
+    <!-- Login -->
     <div id="login-screen" class="screen active">
       <div class="logo">
         <div class="logo-icon">
@@ -154,12 +21,12 @@
         </div>
         <span class="logo-text">cloudsyncd</span>
       </div>
-      <p class="subtitle">管理端 · 输入本地管理 Token 进入</p>
+      <p class="subtitle">管理端 · 当前服务要求 Token 认证</p>
       <div class="field">
         <label for="token-input">Admin Token</label>
         <input id="token-input" class="token-input" type="password" placeholder="•••• •••• •••• •••• •••• •••• •••• ••••" autocomplete="off" spellcheck="false">
-        <button id="login-btn" class="btn btn-primary" style="width:100%; margin-top: 1rem;">进入</button>
-        <p class="hint">Token 在服务器 <code>data/.admin-token</code> 文件中，持久化在 <code>data/state.json</code>，重启不变。可在登录后的「密钥与凭证轮换」里轮换。</p>
+        <button id="login-btn" class="btn btn-primary">进入</button>
+        <p class="hint">默认本地回环管理端无需登录。仅当设置 <code>ADMIN_AUTH=1</code> 或暴露 <code>ADMIN_HOST</code> 时需要 Token。</p>
       </div>
     </div>
 
@@ -174,8 +41,11 @@
         </div>
         <div class="topbar-right">
           <span class="uptime" id="uptime">—</span>
-          <button id="refresh-btn" class="btn btn-secondary">刷新</button>
-          <button id="logout-btn" class="btn btn-ghost">退出</button>
+          <button id="refresh-btn" class="btn btn-secondary refresh-btn">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
+            <span>刷新</span>
+          </button>
+          <button id="logout-btn" class="btn btn-ghost" style="display:none;">退出</button>
         </div>
       </div>
 
@@ -187,28 +57,18 @@
         <div class="stat"><div class="stat-label">主密钥</div><div class="stat-value ok" id="stat-key">—</div><div class="stat-sub">state.json</div></div>
       </div>
 
-      <!-- Pairing -->
+      <!-- Device management: pair new + paired list -->
       <div class="card">
         <div class="card-head">
-          <span class="card-title">配对新设备</span>
+          <span class="card-title">设备管理</span>
           <div class="card-actions">
             <button id="newpin-btn" class="btn btn-primary">生成新 PIN</button>
+            <button id="revoke-all-btn" class="btn btn-danger">全部撤销</button>
           </div>
         </div>
         <div id="pin-result" class="pin-result">
           <div class="pin-big" id="pin-value">000000</div>
           <p class="pin-note">在待配对设备的网页端输入此 PIN。PIN 为一次性，验证成功或重试耗尽后失效。</p>
-        </div>
-        <div id="pin-empty" class="empty" style="padding:0.5rem 0;">尚未生成 PIN</div>
-      </div>
-
-      <!-- Devices -->
-      <div class="card">
-        <div class="card-head">
-          <span class="card-title">已配对设备</span>
-          <div class="card-actions">
-            <button id="revoke-all-btn" class="btn btn-danger">全部撤销</button>
-          </div>
         </div>
         <div id="devices-body">
           <div class="empty">加载中…</div>
@@ -216,7 +76,7 @@
       </div>
 
       <!-- Danger zone: key & token rotation -->
-      <div class="card">
+      <div class="card danger-card">
         <div class="card-head">
           <span class="card-title">密钥与凭证轮换</span>
         </div>
@@ -228,10 +88,10 @@
             </div>
             <button id="rotate-key-btn" class="btn btn-danger">轮换主密钥</button>
           </div>
-          <div class="dz-item">
+          <div class="dz-item" id="token-rotation-item" style="display:none;">
             <div class="dz-text">
               <div class="dz-title">轮换管理 Token</div>
-              <div class="dz-desc">生成新的管理 Token。当前登录会话会自动用新 Token 续期，无需重新登录。</div>
+              <div class="dz-desc">仅在启用管理 Token 认证时使用。当前登录会话会自动用新 Token 续期。</div>
             </div>
             <button id="rotate-token-btn" class="btn btn-secondary">轮换 Token</button>
           </div>
@@ -239,9 +99,22 @@
       </div>
 
       <!-- Shared files -->
-      <div class="card">
+      <div class="card files-card">
         <div class="card-head">
-          <span class="card-title">共享文件（只读）</span>
+          <span class="card-title">共享文件</span>
+          <div class="card-actions">
+            <input id="upload-input" type="file" multiple style="display:none;">
+            <button id="upload-btn" class="btn btn-primary">上传</button>
+            <button id="clear-files-btn" class="btn btn-danger">清空</button>
+          </div>
+        </div>
+        <div id="upload-progress" class="upload-progress"></div>
+        <div class="file-toolbar">
+          <input id="file-search" class="file-search" type="search" placeholder="搜索共享文件" autocomplete="off" spellcheck="false">
+          <span id="file-selection-count" class="file-selection">已选 0</span>
+          <button id="select-visible-files-btn" class="btn btn-secondary">选择当前</button>
+          <button id="clear-file-selection-btn" class="btn btn-ghost">取消选择</button>
+          <button id="delete-selected-files-btn" class="btn btn-danger" disabled>删除选中</button>
         </div>
         <div id="files-body">
           <div class="empty">加载中…</div>

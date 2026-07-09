@@ -1,26 +1,9 @@
 #!/usr/bin/env node
 // Local device management for cloudsyncd.
-// Lists, revokes, or revokes-all paired devices via the admin-token-guarded API.
+// Lists, revokes, or revokes-all paired devices via the local admin API.
 // Run while the server is up (the server must be listening on loopback).
 
-const fs = require('fs');
-const path = require('path');
-
-// Admin API lives on the separate local-only admin port (not the client/tunnel port).
-const ADMIN_PORT = process.env.ADMIN_PORT || 21900;
-const ADMIN_HOST = process.env.ADMIN_HOST || '127.0.0.1';
-const tokenFile = path.join(__dirname, 'data', '.admin-token');
-
-let token;
-try {
-  token = fs.readFileSync(tokenFile, 'utf8').trim();
-} catch {
-  console.error('Cannot read admin token. Is the server running?');
-  process.exit(1);
-}
-
-const base = `http://${ADMIN_HOST}:${ADMIN_PORT}`;
-const headers = { 'x-admin-token': token };
+const { fetchAdminJson } = require('./lib/local-admin');
 
 const args = process.argv.slice(2);
 const cmd = args[0] || '--list';
@@ -36,9 +19,7 @@ function usage() {
 }
 
 async function list() {
-  const r = await fetch(`${base}/api/local/devices`, { headers });
-  const data = await r.json();
-  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+  const data = await fetchAdminJson('/api/local/devices');
   if (!data.devices || data.devices.length === 0) {
     console.log('\nNo paired devices.\n');
     return;
@@ -51,37 +32,27 @@ async function list() {
 }
 
 async function revoke(deviceId) {
-  const r = await fetch(`${base}/api/local/revoke`, {
+  const data = await fetchAdminJson('/api/local/revoke', {
     method: 'POST',
-    headers: { ...headers, 'content-type': 'application/json' },
-    body: JSON.stringify({ deviceId }),
+    body: { deviceId },
   });
-  const data = await r.json();
-  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
   console.log(`\nRevoked: ${data.revoked}  (${data.remaining} remaining)\n`);
 }
 
 async function revokeAll() {
-  const r = await fetch(`${base}/api/local/revoke-all`, {
+  const data = await fetchAdminJson('/api/local/revoke-all', {
     method: 'POST',
-    headers,
   });
-  const data = await r.json();
-  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
   console.log(`\nRevoked ${data.revoked} device(s). All devices are now offline.\n`);
 }
 
 async function rotateKey() {
-  const r = await fetch(`${base}/api/local/rotate-key`, { method: 'POST', headers });
-  const data = await r.json();
-  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+  const data = await fetchAdminJson('/api/local/rotate-key', { method: 'POST' });
   console.log(`\nMaster key rotated. ${data.revoked} device(s) must re-pair.\n`);
 }
 
 async function rotateToken() {
-  const r = await fetch(`${base}/api/local/rotate-token`, { method: 'POST', headers });
-  const data = await r.json();
-  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+  const data = await fetchAdminJson('/api/local/rotate-token', { method: 'POST' });
   console.log(`\nAdmin token rotated. New token: ${data.adminToken}\n`);
 }
 

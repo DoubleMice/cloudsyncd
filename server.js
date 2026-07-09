@@ -14,6 +14,14 @@ const {
   createChunkedEncryptStream,
   encryptedChunkedContentLength,
 } = require('./lib/chunked-encryption');
+const {
+  buildRequestSignatureMessage,
+  deriveRequestAuthKey: deriveProtocolRequestAuthKey,
+  encryptEnvelope,
+  hkdf,
+  hmac,
+  sha256Hex,
+} = require('./lib/protocol');
 
 const app = express();
 app.disable('x-powered-by');
@@ -23,7 +31,7 @@ app.use(express.json({
   },
 }));
 app.use(securityHeaders);
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public'), { setHeaders: staticAssetHeaders }));
 
 // Admin app: a SEPARATE listener bound to loopback only (default :21900).
 // The Cloudflare Tunnel forwards only the client port (PORT = 21891), so
@@ -31,6 +39,12 @@ app.use(express.static(path.join(__dirname, 'public')));
 // only from this machine (http://127.0.0.1:ADMIN_PORT/admin). For remote
 // admin, SSH port-forward ADMIN_PORT instead of exposing it publicly.
 const adminApp = express();
+adminApp.disable('x-powered-by');
+adminApp.use((req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  next();
+});
+adminApp.use(securityHeaders);
 adminApp.use(express.json());
 adminApp.use(express.static(path.join(__dirname, 'admin')));
 adminApp.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'admin', 'admin.html')));
@@ -38,18 +52,25 @@ adminApp.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'admin', 
 const MAX_TEXTS = 100;
 const TEXT_EXPIRY_MS = 24 * 60 * 60 * 1000;
 const MAX_CONCURRENT_DOWNLOADS = 3;
+const MAX_ADMIN_UPLOAD_BYTES = Number(process.env.ADMIN_UPLOAD_MAX_BYTES || 50 * 1024 * 1024 * 1024);
 const REQUEST_AUTH_WINDOW_MS = 5 * 60 * 1000;
 const REQUEST_NONCE_TTL_MS = 10 * 60 * 1000;
 const MAX_NONCES_PER_DEVICE = 512;
 let activeDownloads = 0;
 const seenRequestNonces = new Map();
 
-const DATA_DIR = path.join(__dirname, 'data');
+const ADMIN_PORT = process.env.ADMIN_PORT || 21900;
+const ADMIN_HOST = process.env.ADMIN_HOST || '127.0.0.1';
+const DATA_DIR = process.env.CLOUDSYNCD_DATA_DIR
+  ? path.resolve(process.env.CLOUDSYNCD_DATA_DIR)
+  : path.join(__dirname, 'data');
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
 const ADMIN_TOKEN_FILE = path.join(DATA_DIR, '.admin-token');
 const PRIVATE_DIR_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
-const sharedDir = path.join(__dirname, 'shared');
+const sharedDir = process.env.CLOUDSYNCD_SHARED_DIR
+  ? path.resolve(process.env.CLOUDSYNCD_SHARED_DIR)
+  : path.join(__dirname, 'shared');
 
 // ============ Security Middleware ============
 
@@ -64,6 +85,7 @@ function securityHeaders(req, res, next) {
     "font-src 'self' https://fonts.gstatic.com",
     "img-src 'self' data: blob:",
     "connect-src 'self'",
+    "worker-src 'self'",
     "object-src 'none'",
     "base-uri 'self'",
     "frame-ancestors 'none'",
@@ -74,6 +96,13 @@ function securityHeaders(req, res, next) {
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
   next();
+}
+
+function staticAssetHeaders(res, filePath) {
+  const name = path.basename(filePath);
+  if (name === 'index.html' || name === 'app.js' || name === 'download-sw.js') {
+    res.setHeader('Cache-Control', 'no-store');
+  }
 }
 
 // Minimal in-memory per-IP rate limiter for the unauthenticated pairing
@@ -210,20 +239,8 @@ function generateECDHKeyPair() {
   return { ecdh, publicKey: ecdh.getPublicKey('hex') };
 }
 
-function hkdf(ikm, salt, info, length = 32) {
-  return crypto.hkdfSync('sha256', ikm, salt, info, length);
-}
-
-function hmac(key, data) {
-  return crypto.createHmac('sha256', key).update(data).digest('hex');
-}
-
-function sha256Hex(data) {
-  return crypto.createHash('sha256').update(data).digest('hex');
-}
-
 function deriveRequestAuthKey(deviceId) {
-  return Buffer.from(hkdf(masterKey, 'syncd-request-auth', `device:${deviceId}`, 32));
+  return deriveProtocolRequestAuthKey(masterKey, deviceId);
 }
 
 function safeEqualHex(left, right) {
@@ -250,8 +267,25 @@ function safeEqualAdminToken(token) {
   }
 }
 
-function buildRequestSignatureMessage(method, originalUrl, timestamp, nonce, bodyHash) {
-  return [method.toUpperCase(), originalUrl, timestamp, nonce, bodyHash].join('\n');
+function isLoopbackAdminHost(host) {
+  return host === '127.0.0.1' || host === '::1' || host === 'localhost';
+}
+
+function shouldRequireAdminToken() {
+  if (process.env.ADMIN_AUTH === '1') return true;
+  if (process.env.ADMIN_AUTH === '0') return false;
+  return !isLoopbackAdminHost(ADMIN_HOST);
+}
+
+const REQUIRE_ADMIN_TOKEN = shouldRequireAdminToken();
+
+function requireAdminToken(req, res, next) {
+  if (!REQUIRE_ADMIN_TOKEN) return next();
+  const token = req.headers['x-admin-token'];
+  if (!safeEqualAdminToken(token)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  next();
 }
 
 function pruneSeenNonces(now = Date.now()) {
@@ -341,11 +375,7 @@ function requireDeviceAuth(req, res, next) {
 }
 
 function encrypt(key, plaintext) {
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return { iv: iv.toString('hex'), ciphertext: encrypted.toString('hex'), tag: tag.toString('hex') };
+  return encryptEnvelope(key, plaintext);
 }
 
 function createEncryptStream(key) {
@@ -354,9 +384,38 @@ function createEncryptStream(key) {
   return { cipher, iv };
 }
 
+function setDownloadHeaders(res, headers = {}) {
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Cache-Control', 'no-store');
+  for (const [header, value] of Object.entries(headers)) {
+    res.setHeader(header, value);
+  }
+}
+
+function createStreamCompletion(onComplete) {
+  let completed = false;
+  return (err) => {
+    if (completed) return false;
+    completed = true;
+    if (onComplete) onComplete(err);
+    return true;
+  };
+}
+
+function finishPipedDownload(err, { complete, res, label }) {
+  if (!complete(err)) return;
+  if (!err) return;
+
+  console.error(`[${label}] Stream error:`, err.message);
+  if (!res.headersSent) {
+    res.status(500).json({ error: `${label} failed` });
+  } else if (!res.destroyed) {
+    res.destroy(err);
+  }
+}
+
 function streamEncryptedResponse({ res, sourceStream, extraHeaders = {}, label, onComplete }) {
   const { cipher, iv } = createEncryptStream(masterKey);
-  let completed = false;
   const appendAuthTag = new Transform({
     transform(chunk, encoding, callback) {
       callback(null, chunk);
@@ -371,75 +430,45 @@ function streamEncryptedResponse({ res, sourceStream, extraHeaders = {}, label, 
     },
   });
 
-  const finish = (err) => {
-    if (completed) return;
-    completed = true;
-    if (onComplete) onComplete(err);
-  };
-
-  res.setHeader('Content-Type', 'application/octet-stream');
-  res.setHeader('Cache-Control', 'no-store');
-  res.setHeader('X-Encrypted-IV', iv.toString('hex'));
-  res.setHeader('X-Encrypted-Tag-Length', '16');
-
-  for (const [header, value] of Object.entries(extraHeaders)) {
-    res.setHeader(header, value);
-  }
+  const complete = createStreamCompletion(onComplete);
+  setDownloadHeaders(res, {
+    'X-Encrypted-IV': iv.toString('hex'),
+    'X-Encrypted-Tag-Length': '16',
+    ...extraHeaders,
+  });
 
   pipeline(sourceStream, cipher, appendAuthTag, res, (err) => {
-    if (completed) return;
-    if (err) {
-      console.error(`[${label}] Stream error:`, err.message);
-      finish(err);
-      if (!res.headersSent) {
-        res.status(500).json({ error: `${label} failed` });
-      } else if (!res.destroyed) {
-        res.destroy(err);
-      }
-      return;
-    }
-
-    finish();
+    finishPipedDownload(err, { complete, res, label });
   });
 }
 
 function streamChunkedEncryptedResponse({ res, sourceStream, fileSize, relPath, extraHeaders = {}, label, onComplete }) {
   const { stream, ivPrefix, tagLength } = createChunkedEncryptStream(masterKey, { fileSize, relPath });
-  let completed = false;
-
-  const finish = (err) => {
-    if (completed) return;
-    completed = true;
-    if (onComplete) onComplete(err);
-  };
-
-  res.setHeader('Content-Type', 'application/octet-stream');
-  res.setHeader('Cache-Control', 'no-store');
-  res.setHeader('X-Encrypted-Mode', CHUNKED_ENCRYPTION_MODE);
-  res.setHeader('X-Encrypted-IV-Prefix', ivPrefix.toString('hex'));
-  res.setHeader('X-Encrypted-Chunk-Size', String(DEFAULT_CHUNK_SIZE));
-  res.setHeader('X-Encrypted-Tag-Length', String(tagLength));
-  res.setHeader('Content-Length', String(encryptedChunkedContentLength(fileSize, DEFAULT_CHUNK_SIZE, { relPath })));
-
-  for (const [header, value] of Object.entries(extraHeaders)) {
-    res.setHeader(header, value);
-  }
+  const complete = createStreamCompletion(onComplete);
+  setDownloadHeaders(res, {
+    'X-Encrypted-Mode': CHUNKED_ENCRYPTION_MODE,
+    'X-Encrypted-IV-Prefix': ivPrefix.toString('hex'),
+    'X-Encrypted-Chunk-Size': String(DEFAULT_CHUNK_SIZE),
+    'X-Encrypted-Tag-Length': String(tagLength),
+    'Content-Length': String(encryptedChunkedContentLength(fileSize, DEFAULT_CHUNK_SIZE, { relPath })),
+    ...extraHeaders,
+  });
 
   pipeline(sourceStream, stream, res, (err) => {
-    if (completed) return;
-    if (err) {
-      console.error(`[${label}] Chunked stream error:`, err.message);
-      finish(err);
-      if (!res.headersSent) {
-        res.status(500).json({ error: `${label} failed` });
-      } else if (!res.destroyed) {
-        res.destroy(err);
-      }
-      return;
-    }
-
-    finish();
+    finishPipedDownload(err, { complete, res, label });
   });
+}
+
+function withDownloadSlot(res, start) {
+  if (activeDownloads >= MAX_CONCURRENT_DOWNLOADS) {
+    res.status(503).json({ error: 'Too many concurrent downloads. Please try again later.' });
+    return false;
+  }
+  activeDownloads++;
+  start(() => {
+    activeDownloads = Math.max(0, activeDownloads - 1);
+  });
+  return true;
 }
 
 // ============ Pending Pairing Session ============
@@ -545,11 +574,11 @@ app.post('/api/pair/verify', pairRateLimit, (req, res) => {
 
 // ============ Local-only (admin app): Generate new PIN ============
 
-adminApp.post('/api/local/new-pin', (req, res) => {
-  const token = req.headers['x-admin-token'];
-  if (!safeEqualAdminToken(token)) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
+adminApp.get('/api/local/auth', (req, res) => {
+  res.json({ requiresToken: REQUIRE_ADMIN_TOKEN });
+});
+
+adminApp.post('/api/local/new-pin', requireAdminToken, (req, res) => {
   const pin = createPairSession();
   res.json({ pin });
 });
@@ -563,11 +592,101 @@ function revokeDevice(id) {
   return before - devices.length;
 }
 
-adminApp.get('/api/local/status', (req, res) => {
-  const token = req.headers['x-admin-token'];
-  if (!safeEqualAdminToken(token)) {
-    return res.status(403).json({ error: 'Forbidden' });
+function ensureSharedDir() {
+  fs.mkdirSync(sharedDir, { recursive: true });
+  return fs.realpathSync(sharedDir);
+}
+
+function normalizeSharedRelPath(relPath) {
+  const normalized = String(relPath || '').replace(/\\/g, '/').replace(/^\/+/, '');
+  const parts = normalized.split('/');
+  if (
+    !normalized
+    || parts.some((part) => !part || part === '.' || part === '..' || part.startsWith('.'))
+  ) {
+    throw new Error('Invalid shared file path');
   }
+  return parts.join('/');
+}
+
+function resolveSharedWriteTarget(relPath) {
+  const realShared = ensureSharedDir();
+  const safeRelPath = normalizeSharedRelPath(relPath);
+  const target = path.resolve(path.join(realShared, safeRelPath));
+  const rel = path.relative(realShared, target);
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+    throw new Error('Shared file path escapes shared directory');
+  }
+  return { target, rel: safeRelPath };
+}
+
+function resolveSharedExistingFile(relPath) {
+  const { target, rel } = resolveSharedWriteTarget(relPath);
+  let lstat;
+  try {
+    lstat = fs.lstatSync(target);
+  } catch {
+    const err = new Error('Not found');
+    err.status = 404;
+    throw err;
+  }
+  if (!lstat.isFile()) {
+    const err = new Error('Not found');
+    err.status = 404;
+    throw err;
+  }
+  let realFile;
+  try {
+    realFile = fs.realpathSync(target);
+  } catch {
+    const err = new Error('Not found');
+    err.status = 404;
+    throw err;
+  }
+  const realShared = fs.realpathSync(sharedDir);
+  const realRel = path.relative(realShared, realFile);
+  if (realRel === '' || realRel.startsWith('..') || path.isAbsolute(realRel)) {
+    const err = new Error('Access denied');
+    err.status = 403;
+    throw err;
+  }
+  const stat = fs.statSync(realFile);
+  if (!stat.isFile()) {
+    const err = new Error('Not found');
+    err.status = 404;
+    throw err;
+  }
+  return { target, realFile, rel, stat };
+}
+
+function assertSharedParentContained(target) {
+  const realShared = fs.realpathSync(sharedDir);
+  const realParent = fs.realpathSync(path.dirname(target));
+  const rel = path.relative(realShared, realParent);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) {
+    throw new Error('Shared file path escapes shared directory');
+  }
+}
+
+function removeEmptySharedParents(startDir) {
+  const realShared = fs.realpathSync(sharedDir);
+  let current = path.resolve(startDir);
+  while (current !== realShared && path.relative(realShared, current) && !path.relative(realShared, current).startsWith('..')) {
+    try {
+      fs.rmdirSync(current);
+    } catch {
+      return;
+    }
+    current = path.dirname(current);
+  }
+}
+
+function sharedPathError(res, err) {
+  const status = err && err.status ? err.status : 400;
+  res.status(status).json({ error: err.message || 'Invalid shared file path' });
+}
+
+adminApp.get('/api/local/status', requireAdminToken, (req, res) => {
   if (!fs.existsSync(sharedDir)) fs.mkdirSync(sharedDir, { recursive: true });
   const entries = walkDir(sharedDir);
   let fileCount = 0;
@@ -592,28 +711,92 @@ adminApp.get('/api/local/status', (req, res) => {
   });
 });
 
-adminApp.get('/api/local/files', (req, res) => {
-  const token = req.headers['x-admin-token'];
-  if (!safeEqualAdminToken(token)) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
-  if (!fs.existsSync(sharedDir)) fs.mkdirSync(sharedDir, { recursive: true });
+adminApp.get('/api/local/files', requireAdminToken, (req, res) => {
+  ensureSharedDir();
   res.json({ entries: walkDir(sharedDir) });
 });
 
-adminApp.get('/api/local/devices', (req, res) => {
-  const token = req.headers['x-admin-token'];
-  if (!safeEqualAdminToken(token)) {
-    return res.status(403).json({ error: 'Forbidden' });
+adminApp.post('/api/local/files/clear', requireAdminToken, (req, res) => {
+  fs.rmSync(sharedDir, { recursive: true, force: true });
+  fs.mkdirSync(sharedDir, { recursive: true });
+  console.log('[ADMIN] Cleared shared directory');
+  res.json({ success: true, removed: 'all' });
+});
+
+adminApp.put(/^\/api\/local\/files\/(.*)/, requireAdminToken, (req, res) => {
+  let target;
+  let rel;
+  try {
+    const resolved = resolveSharedWriteTarget(req.params[0] || '');
+    target = resolved.target;
+    rel = resolved.rel;
+  } catch (err) {
+    return sharedPathError(res, err);
   }
+
+  const contentLength = Number(req.headers['content-length'] || 0);
+  if (Number.isFinite(contentLength) && contentLength > MAX_ADMIN_UPLOAD_BYTES) {
+    return res.status(413).json({ error: 'Upload is too large' });
+  }
+
+  try {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    assertSharedParentContained(target);
+  } catch (err) {
+    return sharedPathError(res, err);
+  }
+  const tmpPath = path.join(
+    path.dirname(target),
+    `.${path.basename(target)}.${process.pid}.${Date.now()}.upload`
+  );
+  let uploadedBytes = 0;
+  const limitStream = new Transform({
+    transform(chunk, encoding, callback) {
+      uploadedBytes += chunk.length;
+      if (uploadedBytes > MAX_ADMIN_UPLOAD_BYTES) {
+        callback(new Error('Upload is too large'));
+        return;
+      }
+      callback(null, chunk);
+    },
+  });
+
+  pipeline(req, limitStream, fs.createWriteStream(tmpPath, { mode: 0o600 }), (err) => {
+    if (err) {
+      fs.rmSync(tmpPath, { force: true });
+      const status = err.message === 'Upload is too large' ? 413 : 500;
+      if (!res.headersSent) res.status(status).json({ error: err.message || 'Upload failed' });
+      return;
+    }
+    try {
+      fs.renameSync(tmpPath, target);
+      console.log(`[ADMIN] Uploaded shared file: ${rel} (${uploadedBytes} bytes)`);
+      res.json({ success: true, name: rel, size: uploadedBytes });
+    } catch (renameErr) {
+      fs.rmSync(tmpPath, { force: true });
+      if (!res.headersSent) res.status(500).json({ error: renameErr.message || 'Upload failed' });
+    }
+  });
+});
+
+adminApp.delete(/^\/api\/local\/files\/(.*)/, requireAdminToken, (req, res) => {
+  let file;
+  try {
+    file = resolveSharedExistingFile(req.params[0] || '');
+  } catch (err) {
+    return sharedPathError(res, err);
+  }
+  fs.unlinkSync(file.target);
+  removeEmptySharedParents(path.dirname(file.target));
+  console.log(`[ADMIN] Deleted shared file: ${file.rel}`);
+  res.json({ success: true, deleted: file.rel });
+});
+
+adminApp.get('/api/local/devices', requireAdminToken, (req, res) => {
   res.json({ devices });
 });
 
-adminApp.post('/api/local/revoke', (req, res) => {
-  const token = req.headers['x-admin-token'];
-  if (!safeEqualAdminToken(token)) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
+adminApp.post('/api/local/revoke', requireAdminToken, (req, res) => {
   const { deviceId } = req.body || {};
   if (!deviceId || typeof deviceId !== 'string') {
     return res.status(400).json({ error: 'Missing deviceId' });
@@ -626,11 +809,7 @@ adminApp.post('/api/local/revoke', (req, res) => {
   res.json({ success: true, revoked: deviceId, remaining: devices.length });
 });
 
-adminApp.post('/api/local/revoke-all', (req, res) => {
-  const token = req.headers['x-admin-token'];
-  if (!safeEqualAdminToken(token)) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
+adminApp.post('/api/local/revoke-all', requireAdminToken, (req, res) => {
   const count = devices.length;
   devices = [];
   persistDevices();
@@ -638,22 +817,14 @@ adminApp.post('/api/local/revoke-all', (req, res) => {
   res.json({ success: true, revoked: count, remaining: 0 });
 });
 
-adminApp.post('/api/local/rotate-key', (req, res) => {
-  const token = req.headers['x-admin-token'];
-  if (!safeEqualAdminToken(token)) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
+adminApp.post('/api/local/rotate-key', requireAdminToken, (req, res) => {
   const revoked = devices.length;
   rotateMasterKey();
   console.log(`[KEY] Master key rotated; ${revoked} device(s) must re-pair`);
   res.json({ success: true, revoked, message: 'Master key rotated. All devices must re-pair.' });
 });
 
-adminApp.post('/api/local/rotate-token', (req, res) => {
-  const token = req.headers['x-admin-token'];
-  if (!safeEqualAdminToken(token)) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
+adminApp.post('/api/local/rotate-token', requireAdminToken, (req, res) => {
   adminToken = crypto.randomBytes(16).toString('hex');
   persistState();
   writePrivateFile(ADMIN_TOKEN_FILE, adminToken);
@@ -689,94 +860,62 @@ app.get('/api/files', requireDeviceAuth, (req, res) => {
 });
 
 function resolveSharedFile(relPath, res) {
-  const filePath = path.resolve(path.join(sharedDir, relPath));
-
-  // Containment with real symlink resolution. path.resolve is purely lexical
-  // (it does not follow symlinks), so a string startsWith() guard can be
-  // bypassed by a shared* sibling directory or by a symlink placed inside
-  // shared/. Resolve the real path and require it to stay strictly under the
-  // real shared/ root.
-  let realFile;
   try {
-    realFile = fs.realpathSync(filePath);
-  } catch {
-    res.status(404).json({ error: 'Not found' });
+    return resolveSharedExistingFile(relPath);
+  } catch (err) {
+    sharedPathError(res, err);
     return null;
   }
-  const realShared = fs.realpathSync(sharedDir);
-  const rel = path.relative(realShared, realFile);
-  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
-    res.status(403).json({ error: 'Access denied' });
-    return null;
-  }
-  let stat;
-  try {
-    stat = fs.statSync(realFile);
-  } catch {
-    res.status(404).json({ error: 'Not found' });
-    return null;
-  }
-  if (!stat.isFile()) {
-    res.status(404).json({ error: 'Not found' });
-    return null;
-  }
+}
 
-  return { realFile, rel, stat };
+function sharedFileHeaders(relPath, fileSize) {
+  return {
+    'X-File-Name': encodeURIComponent(path.basename(relPath)),
+    'X-File-Size': String(fileSize),
+  };
+}
+
+function sendSharedFileDownload({ res, file, relPath, chunked }) {
+  const fileSize = file.stat.size;
+  withDownloadSlot(res, (releaseSlot) => {
+    if (chunked) {
+      streamChunkedEncryptedResponse({
+        res,
+        sourceStream: fs.createReadStream(file.realFile, { highWaterMark: DEFAULT_CHUNK_SIZE }),
+        fileSize,
+        relPath,
+        label: 'FILE-CHUNKED',
+        extraHeaders: sharedFileHeaders(relPath, fileSize),
+        onComplete: releaseSlot,
+      });
+      return;
+    }
+
+    streamEncryptedResponse({
+      res,
+      sourceStream: fs.createReadStream(file.realFile),
+      label: 'FILE',
+      extraHeaders: {
+        'Content-Length': String(fileSize + 16),
+        ...sharedFileHeaders(relPath, fileSize),
+      },
+      onComplete: releaseSlot,
+    });
+  });
 }
 
 app.get(/^\/api\/files-chunked\/(.*)/, requireDeviceAuth, (req, res) => {
   const relPath = req.params[0] || '';
   const file = resolveSharedFile(relPath, res);
   if (!file) return;
-
-  const fileSize = file.stat.size;
-
-  if (activeDownloads >= MAX_CONCURRENT_DOWNLOADS) {
-    return res.status(503).json({ error: 'Too many concurrent downloads. Please try again later.' });
-  }
-
-  activeDownloads++;
-  streamChunkedEncryptedResponse({
-    res,
-    sourceStream: fs.createReadStream(file.realFile, { highWaterMark: DEFAULT_CHUNK_SIZE }),
-    fileSize,
-    relPath,
-    label: 'FILE-CHUNKED',
-    extraHeaders: {
-      'X-File-Name': encodeURIComponent(path.basename(relPath)),
-      'X-File-Size': String(fileSize),
-    },
-    onComplete: () => {
-      activeDownloads--;
-    },
-  });
+  sendSharedFileDownload({ res, file, relPath: file.rel, chunked: true });
 });
 
 app.get(/^\/api\/files\/(.*)/, requireDeviceAuth, (req, res) => {
   const relPath = req.params[0] || '';
   const file = resolveSharedFile(relPath, res);
   if (!file) return;
-
-  const fileSize = file.stat.size;
-
-  if (activeDownloads >= MAX_CONCURRENT_DOWNLOADS) {
-    return res.status(503).json({ error: 'Too many concurrent downloads. Please try again later.' });
-  }
-
-  activeDownloads++;
-  streamEncryptedResponse({
-    res,
-    sourceStream: fs.createReadStream(file.realFile),
-    label: 'FILE',
-    extraHeaders: {
-      'Content-Length': String(fileSize + 16),
-      'X-File-Name': encodeURIComponent(path.basename(relPath)),
-      'X-File-Size': String(fileSize),
-    },
-    onComplete: () => {
-      activeDownloads--;
-    },
-  });
+  sendSharedFileDownload({ res, file, relPath: file.rel, chunked: false });
 });
 
 // ============ Batch Download ============
@@ -799,22 +938,17 @@ app.get('/api/batch', requireDeviceAuth, (req, res) => {
     return res.status(204).end();
   }
 
-  if (activeDownloads >= MAX_CONCURRENT_DOWNLOADS) {
-    return res.status(503).json({ error: 'Too many concurrent downloads. Please try again later.' });
-  }
-
-  activeDownloads++;
-  streamEncryptedResponse({
-    res,
-    sourceStream: tar.create({ gzip: true, cwd: sharedDir }, files),
-    label: 'BATCH',
-    extraHeaders: {
-      'X-Batch-Count': String(files.length),
-      'X-Batch-Total-Size': String(totalSize),
-    },
-    onComplete: () => {
-      activeDownloads--;
-    },
+  withDownloadSlot(res, (releaseSlot) => {
+    streamEncryptedResponse({
+      res,
+      sourceStream: tar.create({ gzip: true, cwd: sharedDir }, files),
+      label: 'BATCH',
+      extraHeaders: {
+        'X-Batch-Count': String(files.length),
+        'X-Batch-Total-Size': String(totalSize),
+      },
+      onComplete: releaseSlot,
+    });
   });
 });
 
@@ -883,8 +1017,6 @@ app.listen(PORT, HOST, () => {
 // Admin port: loopback only, NOT forwarded by the tunnel. Manage at
 // http://127.0.0.1:ADMIN_PORT/admin. Override ADMIN_HOST only if you know
 // exactly what network you're exposing the admin surface to.
-const ADMIN_PORT = process.env.ADMIN_PORT || 21900;
-const ADMIN_HOST = process.env.ADMIN_HOST || '127.0.0.1';
 adminApp.listen(ADMIN_PORT, ADMIN_HOST, () => {
-  console.log(`cloudsyncd admin   on http://${ADMIN_HOST}:${ADMIN_PORT}/admin  (local only)`);
+  console.log(`cloudsyncd admin   on http://${ADMIN_HOST}:${ADMIN_PORT}/admin  (${REQUIRE_ADMIN_TOKEN ? 'token auth' : 'local no-auth'})`);
 });

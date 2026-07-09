@@ -6,7 +6,7 @@
 
 默认只监听本机回环地址，适合配合 Cloudflare Tunnel 或 SSH 端口转发使用，不建议直接暴露 Node 服务端口。
 
-![cloudsyncd client pairing screen](./docs/client_web.png)
+![cloudsyncd client web interface](./docs/client_web.png)
 
 ## 快速开始
 
@@ -31,7 +31,9 @@ cloudsyncd server pin
 默认端口：
 
 - 接收端页面: `http://127.0.0.1:21891`
-- 本地管理端: `http://127.0.0.1:21900/admin`
+- 本地管理端: `http://127.0.0.1:21900/admin`（本机直接打开，无需登录）
+
+本地管理端可生成 PIN、撤销设备、轮换主密钥，并搜索、上传、单个删除、多选删除或清空 `shared/` 共享文件。
 
 第一次接收时会触发配对：
 
@@ -40,7 +42,7 @@ cloudsyncd client list https://your-sync-host.example
 cloudsyncd client get https://your-sync-host.example "dir/file.pdf"
 ```
 
-浏览器接收端支持大文件分块解密和认证完成校验；Chrome / Edge 等支持 File System Access API 的浏览器会直接流式写入磁盘。
+浏览器接收端支持大文件分块解密和认证完成校验；支持 Service Worker 时，大文件由浏览器下载管理器接管，离开页面后仍可继续下载。不可用时回退到 File System Access 流式写入。CLI 的 `cloudsyncd client get` 也使用分块流式解密，适合大文件和自动化下载。
 
 没有全局安装时也可以直接运行：
 
@@ -75,7 +77,7 @@ cloudsyncd server devices
 cloudsyncd server revoke <device-id>
 cloudsyncd server revoke-all
 cloudsyncd server rotate-key
-cloudsyncd server rotate-token
+cloudsyncd server rotate-token  # 仅在启用 ADMIN_AUTH=1 或暴露 ADMIN_HOST 时需要
 ```
 
 接收端：
@@ -86,6 +88,8 @@ cloudsyncd client get <share-url> <remote-path> [-o <path>] [--force]
 cloudsyncd client batch <share-url> [-o <file.tar.gz>] [--since <ISO>]
 cloudsyncd client logout <share-url>
 ```
+
+`client get` 会流式分块解密并原子替换输出文件；目标文件已存在时需加 `--force`。
 
 完整菜单以 CLI 为准：
 
@@ -159,7 +163,7 @@ curl -i https://your-sync-host.example/api/status
 
 运行态目录默认忽略，不应提交：
 
-- `data/`: 主密钥、设备列表、管理 Token
+- `data/`: 主密钥、设备列表、可选管理 Token
 - `shared/`: 分享载荷
 - `downloads/`: 接收端下载
 - `cloudflared-config.yml`、`.cloudflared/`: 本地 Tunnel 配置和凭证
@@ -169,10 +173,11 @@ npm 包由 `package.json` 的 `files` 白名单控制，不包含 `test/`、`dat
 
 ## 安全边界
 
-- `data/state.json` 含主密钥和管理 Token，必须保持忽略；服务端启动时会把 `data/` 收紧到 `0700`，把密钥文件收紧到 `0600`。
+- `data/state.json` 含主密钥、设备列表和可选管理 Token，必须保持忽略；服务端启动时会把 `data/` 收紧到 `0700`，把密钥文件收紧到 `0600`。
 - `shared/` 中的文件会对已配对设备可见。
-- 浏览器接收端会把主密钥保存在 IndexedDB。
+- 浏览器接收端会把主密钥保存在 IndexedDB；大文件后台下载时会把本次下载所需密钥短暂交给同源 Service Worker，仅保存在内存中。
 - 所有已配对设备共享同一个主密钥；轮换主密钥后全部设备需要重新配对。
 - Cloudflare Tunnel 只提供入口转发，不替代应用层鉴权；需要额外门禁时配置 Cloudflare Zero Trust Access。
+- 本地管理端默认只绑定 `127.0.0.1:21900`，本机打开不需要认证；设置 `ADMIN_AUTH=1` 或将 `ADMIN_HOST` 暴露到非回环地址时会启用 Token 认证。
 
 发布前检查项见 [OPEN_SOURCE_AUDIT.md](./OPEN_SOURCE_AUDIT.md)。

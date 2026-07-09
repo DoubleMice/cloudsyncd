@@ -1,4 +1,5 @@
 const assert = require('assert');
+const { spawnSync } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
 const http = require('http');
@@ -24,6 +25,8 @@ const {
   usage,
 } = require('../lib/cli');
 const {
+  CHUNKED_ENCRYPTION_MODE,
+  createChunkedDecryptStream,
   createChunkedEncryptStream,
   decryptChunkedFrames,
   encryptedChunkedContentLength,
@@ -63,6 +66,23 @@ async function collectStream(readable) {
   return Buffer.concat(chunks);
 }
 
+function extractFunctionSource(source, name) {
+  const start = source.indexOf(`function ${name}`);
+  assert.notStrictEqual(start, -1, `missing function ${name}`);
+  const paramsEnd = source.indexOf(')', start);
+  assert.notStrictEqual(paramsEnd, -1, `missing function parameter list for ${name}`);
+  const bodyStart = source.indexOf('{', paramsEnd);
+  let depth = 0;
+  for (let i = bodyStart; i < source.length; i += 1) {
+    if (source[i] === '{') depth += 1;
+    else if (source[i] === '}') {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, i + 1);
+    }
+  }
+  throw new Error(`unterminated function ${name}`);
+}
+
 async function startMockShareServer() {
   const pin = '123456';
   const masterKey = crypto.randomBytes(32);
@@ -76,6 +96,10 @@ async function startMockShareServer() {
   const files = new Map([
     ['目录/文件 空格.txt', Buffer.from('hello world\n')],
   ]);
+  const requests = {
+    chunkedDownloads: 0,
+    legacyDownloads: 0,
+  };
 
   function requireAuth(req, res) {
     const deviceId = req.headers['x-device-id'];
@@ -137,7 +161,41 @@ async function startMockShareServer() {
         return;
       }
 
+      if (req.method === 'GET' && url.pathname.startsWith('/api/files-chunked/')) {
+        requests.chunkedDownloads += 1;
+        if (!requireAuth(req, res)) return;
+        const remotePath = decodeURIComponent(url.pathname.slice('/api/files-chunked/'.length));
+        const payload = files.get(remotePath);
+        if (!payload) {
+          res.writeHead(404, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Not found' }));
+          return;
+        }
+        const chunkSize = 1024;
+        const { stream, ivPrefix, tagLength } = createChunkedEncryptStream(masterKey, {
+          chunkSize,
+          fileSize: payload.length,
+          relPath: remotePath,
+        });
+        res.writeHead(200, {
+          'content-type': 'application/octet-stream',
+          'x-encrypted-mode': CHUNKED_ENCRYPTION_MODE,
+          'x-encrypted-iv-prefix': ivPrefix.toString('hex'),
+          'x-encrypted-chunk-size': String(chunkSize),
+          'x-encrypted-tag-length': String(tagLength),
+          'x-file-name': encodeURIComponent(path.basename(remotePath)),
+          'x-file-size': String(payload.length),
+        });
+        Readable.from([
+          payload.subarray(0, 3),
+          payload.subarray(3, 8),
+          payload.subarray(8),
+        ]).pipe(stream).pipe(res);
+        return;
+      }
+
       if (req.method === 'GET' && url.pathname.startsWith('/api/files/')) {
+        requests.legacyDownloads += 1;
         if (!requireAuth(req, res)) return;
         const remotePath = decodeURIComponent(url.pathname.slice('/api/files/'.length));
         const payload = files.get(remotePath);
@@ -180,6 +238,7 @@ async function startMockShareServer() {
   return {
     baseUrl: `http://127.0.0.1:${address.port}`,
     pin,
+    requests,
     close: () => new Promise((resolve) => server.close(resolve)),
   };
 }
@@ -241,6 +300,8 @@ test('help output separates server and client roles', () => {
   assert.match(text, /setup --start/);
   assert.match(text, /setup --tunnel/);
   assert.match(text, /client-profiles\.json/);
+  assert.match(text, /Local admin at 127\.0\.0\.1:21900 opens without login by default/);
+  assert.match(text, /ADMIN_AUTH=1/);
   assert.match(text, /no plain curl URL/);
 });
 
@@ -267,6 +328,39 @@ test('share alias defaults to add and resolves paths from caller cwd', () => {
     normalizeShareAddArgs(['/tmp/already-absolute.tar.gz'], callerDir),
     ['/tmp/already-absolute.tar.gz']
   );
+});
+
+test('share add skips files already present in shared without deleting them', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cloudsyncd-share-same-'));
+  const shared = path.join(dir, 'shared');
+  fs.mkdirSync(shared);
+  const alreadyShared = path.join(shared, 'already.txt');
+  fs.writeFileSync(alreadyShared, 'keep me');
+  const alreadySharedDir = path.join(shared, 'nested');
+  fs.mkdirSync(alreadySharedDir);
+  fs.writeFileSync(path.join(alreadySharedDir, 'child.txt'), 'child');
+
+  const result = spawnSync(process.execPath, [path.join(__dirname, '..', 'share.js'), alreadyShared], {
+    cwd: path.join(__dirname, '..'),
+    env: { ...process.env, CLOUDSYNCD_SHARED_DIR: shared },
+    encoding: 'utf8',
+  });
+
+  assert.strictEqual(result.status, 0, result.stderr);
+  assert.strictEqual(fs.readFileSync(alreadyShared, 'utf8'), 'keep me');
+  assert.match(result.stdout, /\[same\]/);
+  assert.match(result.stdout, /已存在 1/);
+
+  const dirResult = spawnSync(process.execPath, [path.join(__dirname, '..', 'share.js'), alreadySharedDir], {
+    cwd: path.join(__dirname, '..'),
+    env: { ...process.env, CLOUDSYNCD_SHARED_DIR: shared },
+    encoding: 'utf8',
+  });
+
+  assert.strictEqual(dirResult.status, 0, dirResult.stderr);
+  assert.strictEqual(fs.existsSync(path.join(alreadySharedDir, 'nested')), false);
+  assert.match(dirResult.stderr, /避免递归复制自身/);
+  assert.match(dirResult.stdout, /跳过目录 1/);
 });
 
 test('option parser handles client flags and rejects missing values', () => {
@@ -463,6 +557,21 @@ test('chunked encryption frames decrypt after fixed-size stream chunking', async
   assert.deepStrictEqual(decrypted.plaintext, plain);
   assert.strictEqual(decrypted.manifest.chunkCount, 4);
 
+  let streamedManifest = null;
+  const streamDecrypted = await collectStream(Readable.from([
+    encrypted.subarray(0, 5),
+    encrypted.subarray(5, chunkSize + 21),
+    encrypted.subarray(chunkSize + 21),
+  ]).pipe(createChunkedDecryptStream(key, {
+    ivPrefix,
+    chunkSize,
+    fileSize: plain.length,
+    relPath,
+    onManifest: (manifest) => { streamedManifest = manifest; },
+  })));
+  assert.deepStrictEqual(streamDecrypted, plain);
+  assert.strictEqual(streamedManifest.chunkCount, 4);
+
   const dataOnlyLength = plain.length + decrypted.manifest.chunkCount * (4 + 16);
   assert.throws(
     () => decryptChunkedFrames(encrypted.subarray(0, dataOnlyLength), key, ivPrefix, {
@@ -494,6 +603,27 @@ test('chunked encryption frames decrypt after fixed-size stream chunking', async
     decryptChunkedFrames(emptyEncrypted, key, emptyIvPrefix, { chunkSize, fileSize: 0, relPath: '' }).plaintext,
     Buffer.alloc(0)
   );
+});
+
+test('browser large downloads avoid unsafe blob fallback paths', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+  const openChunked = extractFunctionSource(source, 'openChunkedDownloadSink');
+  const openZip = extractFunctionSource(source, 'openZipSink');
+  const collectFileBytes = extractFunctionSource(source, 'collectFileBytes');
+  const serviceWorker = fs.readFileSync(path.join(__dirname, '..', 'public', 'download-sw.js'), 'utf8');
+
+  assert.doesNotMatch(openChunked, /return null/);
+  assert.match(openChunked, /openWorkerManagedChunkedDownload/);
+  assert.match(openChunked, /wantsFilesystemDownload\(\)/);
+  assert.match(openChunked, /canStreamToDisk\(\)/);
+  assert.match(openChunked, /cloudsyncd client get/);
+  assert.match(serviceWorker, /source: 'chunked-fetch'/);
+  assert.match(serviceWorker, /cloudsyncd-download-ping/);
+  assert.match(serviceWorker, /chunked-fetch-v1/);
+  assert.match(serviceWorker, /Content-Disposition/);
+  assert.match(openZip, /BLOB_DOWNLOAD_FALLBACK_MAX_BYTES/);
+  assert.match(openZip, /批量文件过大/);
+  assert.match(collectFileBytes, /assertChunkedDownloadComplete\(finalManifest, total\)/);
 });
 
 test('client list auto-pairs and stores a receiver profile', async () => {
@@ -584,6 +714,7 @@ test('client get decrypts unicode path downloads and refuses overwrite', async (
   try {
     const result = await client.downloadFile(server.baseUrl, '目录/文件 空格.txt', { pin: server.pin, output: out });
     assert.strictEqual(result.outputPath, out);
+    assert.strictEqual(result.streamed, true);
     assert.strictEqual(fs.readFileSync(out, 'utf8'), 'hello world\n');
     await assert.rejects(
       () => client.downloadFile(server.baseUrl, '目录/文件 空格.txt', { output: out }),
@@ -597,6 +728,8 @@ test('client get decrypts unicode path downloads and refuses overwrite', async (
     const namedResult = await client.downloadFile(server.baseUrl, '目录/文件 空格.txt', { output: outputDir });
     assert.strictEqual(namedResult.outputPath, path.join(outputDir, '文件 空格.txt'));
     assert.strictEqual(fs.readFileSync(namedResult.outputPath, 'utf8'), 'hello world\n');
+    assert.strictEqual(server.requests.chunkedDownloads, 4);
+    assert.strictEqual(server.requests.legacyDownloads, 0);
   } finally {
     await server.close();
   }

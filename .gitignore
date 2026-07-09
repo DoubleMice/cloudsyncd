@@ -37,6 +37,8 @@ yarn-debug.log*
 yarn-error.log*
 coverage/
 .nyc_output/
+test-results/
+playwright-report/
 
 # Python/local tooling
 __pycache__/
