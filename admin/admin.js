@@ -33,6 +33,9 @@ async function api(path, { method = 'GET', body } = {}) {
   const text = await res.text();
   if (text) { try { data = JSON.parse(text); } catch { data = { error: text }; } }
   if (res.status === 403 && authRequired) { logout(true); throw new Error('会话失效，请重新登录'); }
+  if (res.status === 404 && path === '/api/local/downloads') {
+    throw new Error('下载记录接口尚未启用，请重启 cloudsyncd 服务后刷新页面');
+  }
   if (!res.ok) throw new Error((data && data.error) || `HTTP ${res.status}`);
   return data;
 }
@@ -194,6 +197,40 @@ let lastStatus = null;
 let allFileEntries = [];
 const selectedSharedFiles = new Set();
 let fileSearchQuery = '';
+let allDownloadEntries = [];
+let downloadSearchQuery = '';
+
+function activateTab(name, { updateHash = true, focus = false } = {}) {
+  const validName = ['overview', 'files', 'downloads'].includes(name) ? name : 'overview';
+  document.querySelectorAll('.admin-tab').forEach((tab) => {
+    const selected = tab.dataset.tab === validName;
+    tab.classList.toggle('active', selected);
+    tab.setAttribute('aria-selected', String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+    if (selected && focus) tab.focus();
+  });
+  document.querySelectorAll('.admin-panel').forEach((panel) => {
+    const selected = panel.dataset.panel === validName;
+    panel.classList.toggle('active', selected);
+    panel.hidden = !selected;
+  });
+  if (updateHash && window.location.hash !== `#${validName}`) {
+    history.replaceState(null, '', `#${validName}`);
+  }
+}
+
+function handleTabKeydown(event) {
+  if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+  const tabs = Array.from(document.querySelectorAll('.admin-tab'));
+  const current = tabs.indexOf(event.currentTarget);
+  let next = current;
+  if (event.key === 'ArrowLeft') next = (current - 1 + tabs.length) % tabs.length;
+  if (event.key === 'ArrowRight') next = (current + 1) % tabs.length;
+  if (event.key === 'Home') next = 0;
+  if (event.key === 'End') next = tabs.length - 1;
+  event.preventDefault();
+  activateTab(tabs[next].dataset.tab, { focus: true });
+}
 
 async function loadStatus() {
   try {
@@ -245,6 +282,42 @@ async function loadFiles() {
     body.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
     updateFileSelectionUi();
   }
+}
+
+async function loadDownloads() {
+  const body = $('downloads-body');
+  try {
+    const { entries } = await api('/api/local/downloads');
+    allDownloadEntries = Array.isArray(entries) ? entries : [];
+    renderDownloads();
+  } catch (e) {
+    allDownloadEntries = [];
+    body.innerHTML = `<div class="empty">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderDownloads() {
+  const body = $('downloads-body');
+  const query = downloadSearchQuery.trim().toLowerCase();
+  const entries = query
+    ? allDownloadEntries.filter((entry) => `${entry.name} ${entry.deviceId}`.toLowerCase().includes(query))
+    : allDownloadEntries;
+  if (!allDownloadEntries.length) {
+    body.innerHTML = '<div class="empty">暂无下载记录</div>';
+    return;
+  }
+  if (!entries.length) {
+    body.innerHTML = '<div class="empty">没有匹配的下载记录</div>';
+    return;
+  }
+  const rows = entries.map((entry) => {
+    const statusClass = entry.status === 'completed' ? 'ok' : 'failed';
+    const statusText = entry.status === 'completed' ? '完成' : '失败';
+    const typeText = entry.type === 'batch' ? `批量 · ${entry.fileCount || 0} 个` : '单文件';
+    const title = entry.error ? ` title="${escapeHtml(entry.error)}"` : '';
+    return `<tr><td><div class="download-name" title="${escapeHtml(entry.name)}">${escapeHtml(entry.name)}</div><div class="download-meta">${typeText}</div></td><td class="mono download-device" title="${escapeHtml(entry.deviceId)}">${escapeHtml(entry.deviceId)}</td><td class="muted">${fmtSize(entry.size)}</td><td class="muted">${escapeHtml(fmtDate(entry.completedAt || entry.startedAt))}</td><td class="right"><span class="download-status ${statusClass}"${title}>${statusText}</span></td></tr>`;
+  }).join('');
+  body.innerHTML = `<div class="table-scroll"><table class="tbl downloads-table"><thead><tr><th>文件</th><th>设备</th><th>大小</th><th>时间</th><th class="right">状态</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 function renderFiles() {
@@ -467,6 +540,18 @@ async function clearSharedFiles() {
   }
 }
 
+async function clearDownloadHistory() {
+  if (!allDownloadEntries.length) return;
+  if (!confirm(`清空全部 ${allDownloadEntries.length} 条下载记录？`)) return;
+  try {
+    const result = await api('/api/local/downloads', { method: 'DELETE' });
+    toast(`已清空 ${result.cleared} 条下载记录`, 'ok');
+    await loadDownloads();
+  } catch (e) {
+    toast(e.message, 'err');
+  }
+}
+
 async function rotateKey() {
   if (!confirm('轮换主密钥？\n将生成新主密钥并清空全部已配对设备，所有设备需重新走 PIN 配对。')) return;
   try {
@@ -489,7 +574,7 @@ async function rotateToken() {
   } catch (e) { toast(e.message, 'err'); }
 }
 
-function refreshAll() { loadStatus(); loadDevices(); loadFiles(); }
+function refreshAll() { loadStatus(); loadDevices(); loadFiles(); loadDownloads(); }
 
 // ---------- init ----------
 document.addEventListener('DOMContentLoaded', async () => {
@@ -507,14 +592,22 @@ document.addEventListener('DOMContentLoaded', async () => {
   $('upload-btn').addEventListener('click', () => $('upload-input').click());
   $('upload-input').addEventListener('change', uploadFiles);
   $('file-search').addEventListener('input', (e) => { fileSearchQuery = e.target.value; renderFiles(); });
+  $('download-search').addEventListener('input', (e) => { downloadSearchQuery = e.target.value; renderDownloads(); });
+  $('clear-downloads-btn').addEventListener('click', clearDownloadHistory);
   $('select-visible-files-btn').addEventListener('click', selectVisibleFiles);
   $('clear-file-selection-btn').addEventListener('click', clearFileSelection);
   $('delete-selected-files-btn').addEventListener('click', deleteSelectedFiles);
   $('clear-files-btn').addEventListener('click', clearSharedFiles);
   $('rotate-key-btn').addEventListener('click', rotateKey);
   $('rotate-token-btn').addEventListener('click', rotateToken);
+  document.querySelectorAll('.admin-tab').forEach((tab) => {
+    tab.addEventListener('click', () => activateTab(tab.dataset.tab));
+    tab.addEventListener('keydown', handleTabKeydown);
+  });
+  window.addEventListener('hashchange', () => activateTab(window.location.hash.slice(1), { updateHash: false }));
 
   await loadAuthMode();
   applyAuthModeUi();
+  activateTab(window.location.hash.slice(1), { updateHash: false });
   if (!authRequired || getToken()) { showDash(); } else { showLogin(); }
 });

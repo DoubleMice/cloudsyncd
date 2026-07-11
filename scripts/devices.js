@@ -3,19 +3,18 @@
 // Lists, revokes, or revokes-all paired devices via the local admin API.
 // Run while the server is up (the server must be listening on loopback).
 
-const { fetchAdminJson } = require('./lib/local-admin');
+const { fetchAdminJson } = require('../lib/local-admin');
 
 const args = process.argv.slice(2);
 const cmd = args[0] || '--list';
 
 function usage() {
   console.log('用法:');
-  console.log('  node devices.js                    — 列出已配对设备');
-  console.log('  node devices.js --list             — 列出已配对设备');
-  console.log('  node devices.js --revoke <deviceId> — 撤销单个设备');
-  console.log('  node devices.js --revoke-all        — 撤销全部设备（紧急下线）');
-  console.log('  node devices.js --rotate-key        — 轮换主密钥（全部设备需重新配对）');
-  console.log('  node devices.js --rotate-token      — 轮换管理 Token');
+  console.log('  cloudsyncd server devices           — 列出已配对设备');
+  console.log('  cloudsyncd server revoke <deviceId> — 撤销单个设备');
+  console.log('  cloudsyncd server revoke-all        — 撤销全部设备（紧急下线）');
+  console.log('  cloudsyncd server rotate-key        — 轮换主密钥（全部设备需重新配对）');
+  console.log('  cloudsyncd server rotate-token      — 轮换管理 Token');
 }
 
 async function list() {

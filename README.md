@@ -1,117 +1,138 @@
 # cloudsyncd
 
-原始仓库: https://github.com/toads/cloudsysncd
+> 基于原始项目 [toads/cloudsysncd](https://github.com/toads/cloudsysncd) 继续开发。
 
-轻量的 Node.js 文件 / 文本同步服务。分享端通过一次性 PIN 配对接收端；配对后请求使用 `deviceId + timestamp + nonce + HMAC` 鉴权，文件和文本在传输时加密。
+自托管的加密文件分享服务，面向浏览器和命令行接收端。分享端通过一次性 PIN 完成设备配对，随后使用请求签名和 AES-GCM 加密保护文件与文本传输。
 
-默认只监听本机回环地址，适合配合 Cloudflare Tunnel 或 SSH 端口转发使用，不建议直接暴露 Node 服务端口。
+![cloudsyncd 浏览器接收端](./docs/assets/client-web.png)
 
-![cloudsyncd client web interface](./docs/client_web.png)
+## 功能
 
-## 快速开始
+- 分享端与接收端职责分离，提供统一的 `cloudsyncd` CLI。
+- 一次性 PIN 配对，配对后使用设备 ID、时间戳、nonce 和 HMAC 鉴权。
+- 浏览器和 CLI 均支持大文件分块、流式解密。
+- 支持 Cloudflare Tunnel 固定域名，也可仅在本机或 SSH 端口转发中使用。
+- 本地管理端提供设备、共享文件、密钥和下载记录管理。
+- 公网客户端端口与本地管理端口完全分离。
+
+## 环境要求
+
+- Node.js 18 或更高版本
+- npm
+- `cloudflared`，仅在使用 Cloudflare Tunnel 时需要
+
+## 安装
 
 ```bash
+git clone https://github.com/DoubleMice/cloudsyncd.git
+cd cloudsyncd
 npm install
-npm link                 # 可选：安装 cloudsyncd 命令
+npm link
 ```
 
-终端 1：
-
-```bash
-cloudsyncd server start
-```
-
-终端 2：
-
-```bash
-cloudsyncd server share add ./file.pdf
-cloudsyncd server pin
-```
-
-默认端口：
-
-- 接收端页面: `http://127.0.0.1:21891`
-- 本地管理端: `http://127.0.0.1:21900/admin`（本机直接打开，无需登录）
-
-本地管理端可生成 PIN、撤销设备、轮换主密钥，并搜索、上传、单个删除、多选删除或清空 `shared/` 共享文件。
-
-第一次接收时会触发配对：
-
-```bash
-cloudsyncd client list https://your-sync-host.example
-cloudsyncd client get https://your-sync-host.example "dir/file.pdf"
-```
-
-浏览器接收端支持大文件分块解密和认证完成校验；支持 Service Worker 时，大文件由浏览器下载管理器接管，离开页面后仍可继续下载。不可用时回退到 File System Access 流式写入。CLI 的 `cloudsyncd client get` 也使用分块流式解密，适合大文件和自动化下载。
-
-没有全局安装时也可以直接运行：
-
-```bash
-node bin/cloudsyncd.js --help
-npm exec -- cloudsyncd --help
-```
-
-卸载全局命令：
+`npm link` 会把 `cloudsyncd` 注册到当前用户的 PATH。卸载命令：
 
 ```bash
 npm unlink -g cloudsyncd
-npm uninstall -g cloudsyncd   # 如果曾用 npm install -g . 安装
 ```
 
-## 常用命令
+不安装全局命令也可以运行：
 
-分享端：
+```bash
+npm exec -- cloudsyncd --help
+```
+
+## 快速开始
+
+在文件所有者的电脑上启动分享端：
 
 ```bash
 cloudsyncd server start
-cloudsyncd server start --tunnel
-cloudsyncd server status
+```
 
+在另一个终端添加共享文件并生成配对 PIN：
+
+```bash
 cloudsyncd share ./file.pdf
-cloudsyncd share --copy ./file.pdf
+cloudsyncd server pin
+```
+
+接收端第一次访问时会自动进入配对流程：
+
+```bash
+cloudsyncd client list http://127.0.0.1:21891
+cloudsyncd client get http://127.0.0.1:21891 "file.pdf"
+```
+
+默认服务地址：
+
+| 界面 | 地址 | 暴露范围 |
+| --- | --- | --- |
+| 浏览器接收端 | `http://127.0.0.1:21891` | 本机或 Tunnel |
+| 管理端 | `http://127.0.0.1:21900/admin` | 仅本机 |
+
+管理端包含“概览”“共享文件”“下载记录”三个页签。更新服务端代码后需要重启 `cloudsyncd`，新增接口才会生效。
+
+## 运行与重启
+
+`cloudsyncd server start` 默认以前台进程运行，终端关闭后服务也会停止。开发或本地使用时，保持启动终端打开；重启时在该终端按 `Ctrl+C`，然后重新执行：
+
+```bash
+cloudsyncd server start
+```
+
+确认接收端和管理端都已恢复：
+
+```bash
+curl -i http://127.0.0.1:21891/api/status
+curl -i http://127.0.0.1:21900/api/local/status
+```
+
+长期运行时应交给 `launchd`、`systemd` 或其他进程管理器托管，不要依赖临时终端会话。Cloudflare Tunnel 可以继续运行，但 Node origin 停止后接收端将不可用。
+
+## CLI
+
+分享端常用命令：
+
+```bash
+cloudsyncd server start [--tunnel]
+cloudsyncd server status
+cloudsyncd share <paths...> [--copy]
 cloudsyncd share list
 cloudsyncd share clear
-
 cloudsyncd server pin
 cloudsyncd server devices
 cloudsyncd server revoke <device-id>
 cloudsyncd server revoke-all
 cloudsyncd server rotate-key
-cloudsyncd server rotate-token  # 仅在启用 ADMIN_AUTH=1 或暴露 ADMIN_HOST 时需要
 ```
 
-接收端：
+接收端常用命令：
 
 ```bash
-cloudsyncd client list <share-url>
+cloudsyncd client list <share-url> [--json] [--pin <PIN>]
 cloudsyncd client get <share-url> <remote-path> [-o <path>] [--force]
 cloudsyncd client batch <share-url> [-o <file.tar.gz>] [--since <ISO>]
 cloudsyncd client logout <share-url>
 ```
 
-`client get` 会流式分块解密并原子替换输出文件；目标文件已存在时需加 `--force`。
-
-完整菜单以 CLI 为准：
-
-```bash
-cloudsyncd --help
-```
+完整参数以 `cloudsyncd --help` 为准。
 
 ## Cloudflare Tunnel
 
-固定域名使用 named tunnel：
+创建 named tunnel 并生成本地配置：
 
 ```bash
 cloudflared tunnel login
 cloudflared tunnel create sync
-cp cloudflared-config.example.yml cloudflared-config.yml
+cp config/cloudflared.example.yml cloudflared-config.yml
 cloudsyncd server tunnel setup
 cloudsyncd server start --tunnel
 ```
 
-`cloudflared-config.yml` 是本地私有配置，包含 tunnel ID、hostname 和 credentials 路径，已被 `.gitignore` 忽略。
+`cloudflared-config.yml` 包含本地 tunnel ID、hostname 和 credentials 路径，已被 Git 忽略。模板文件不包含真实部署信息。
 
-Tunnel 生命周期：
+Tunnel 管理命令：
 
 ```bash
 cloudsyncd server tunnel validate
@@ -120,64 +141,57 @@ cloudsyncd server tunnel start
 cloudsyncd server tunnel stop
 ```
 
-公网 502 通常表示 Cloudflare 到了，但本机 origin 没响应。按这个顺序查：
-
-```bash
-curl -i http://127.0.0.1:21891/api/status
-lsof -nP -iTCP:21891 -sTCP:LISTEN
-tail -n 80 /tmp/cloudflared-sync.log
-curl -i https://your-sync-host.example/api/status
-```
-
-## Client 侧网络错误
-
-如果 `cloudsyncd client list <share-url>` 报网络错误，先从接收端检查：
-
-```bash
-curl -i https://your-sync-host.example/api/status
-```
-
-判断：
-
-- `curl` 失败：URL、DNS、TLS、代理、防火墙或 Tunnel 不通。
-- 返回 `502`：分享端 origin 没响应，检查 `cloudsyncd server start --tunnel` 和 `127.0.0.1:21891`。
-- 返回 `200`：网络通，检查 PIN 或旧 profile。需要时执行 `cloudsyncd client logout <share-url>` 后重新配对。
-
-新版 CLI 会把旧的 `Error: fetch failed` 展开成失败 URL、底层错误码和排障提示。
-
 ## 架构
 
-![cloudsyncd runtime topology](./docs/diagrams/runtime-topology.png)
+![cloudsyncd 运行拓扑](./docs/diagrams/runtime-topology.png)
 
-更多图和协议说明见 [docs/architecture.md](./docs/architecture.md)。
+Cloudflare Tunnel 只转发接收端口 `21891`。管理端口 `21900` 默认绑定回环地址，`/admin` 和 `/api/local/*` 不经过公网入口。
 
-## 目录
+详细拓扑、服务重启和配对下载时序见 [架构文档](./docs/architecture.md)。
 
-- `bin/`: CLI 入口
-- `lib/`: CLI、接收端 profile 和协议 helper
-- `server.js`: 分享端服务
-- `public/`: 浏览器接收端
-- `admin/`: 本地管理面板
-- `docs/`: 架构说明、截图和图表
-- `cloudflared-config.example.yml`: Tunnel 配置模板
+## 项目结构
 
-运行态目录默认忽略，不应提交：
+```text
+cloudsyncd/
+├── admin/                 # 本地管理端
+├── bin/                   # cloudsyncd CLI 入口
+├── config/                # 配置模板
+├── docs/                  # 架构文档、图表和截图
+│   ├── assets/
+│   └── diagrams/
+├── lib/                   # CLI、协议和客户端实现
+├── public/                # 浏览器接收端
+├── scripts/               # 兼容与运维脚本
+├── tests/                 # 单元测试和 Playwright E2E
+├── server.js              # 分享端服务入口
+└── package.json
+```
 
-- `data/`: 主密钥、设备列表、可选管理 Token
-- `shared/`: 分享载荷
-- `downloads/`: 接收端下载
-- `cloudflared-config.yml`、`.cloudflared/`: 本地 Tunnel 配置和凭证
-- `node_modules/`: 本地依赖
+`data/`、`shared/`、`downloads/` 和 `cloudflared-config.yml` 都是本地运行内容，不应提交。
 
-npm 包由 `package.json` 的 `files` 白名单控制，不包含 `test/`、`data/`、`shared/`、日志、下载缓存或本地 Cloudflare credentials。
+## 安全说明
 
-## 安全边界
+- 不要直接把 Node.js 端口暴露到公网；推荐使用 Cloudflare Tunnel 或 SSH 端口转发。
+- 所有已配对设备共享同一个主密钥；轮换主密钥后，全部设备需要重新配对。
+- 浏览器把配对密钥保存在 IndexedDB；Service Worker 仅在下载期间于内存中持有下载所需密钥。
+- 下载记录最多保存 500 条服务端传输结果。“完成”表示加密响应流发送结束，不代表接收端一定完成解密和落盘。
+- `data/` 包含密钥、设备和下载元数据，服务端会将目录权限收紧为 `0700`、文件权限收紧为 `0600`。
 
-- `data/state.json` 含主密钥、设备列表和可选管理 Token，必须保持忽略；服务端启动时会把 `data/` 收紧到 `0700`，把密钥文件收紧到 `0600`。
-- `shared/` 中的文件会对已配对设备可见。
-- 浏览器接收端会把主密钥保存在 IndexedDB；大文件后台下载时会把本次下载所需密钥短暂交给同源 Service Worker，仅保存在内存中。
-- 所有已配对设备共享同一个主密钥；轮换主密钥后全部设备需要重新配对。
-- Cloudflare Tunnel 只提供入口转发，不替代应用层鉴权；需要额外门禁时配置 Cloudflare Zero Trust Access。
-- 本地管理端默认只绑定 `127.0.0.1:21900`，本机打开不需要认证；设置 `ADMIN_AUTH=1` 或将 `ADMIN_HOST` 暴露到非回环地址时会启用 Token 认证。
+## 开发
 
-发布前检查项见 [OPEN_SOURCE_AUDIT.md](./OPEN_SOURCE_AUDIT.md)。
+```bash
+npm test
+npm run test:e2e
+npm audit --omit=dev
+```
+
+修改 PlantUML 图表后重新生成：
+
+```bash
+plantuml -tpng docs/diagrams/*.puml
+plantuml -tsvg docs/diagrams/*.puml
+```
+
+## License
+
+[ISC](./LICENSE)

@@ -49,6 +49,13 @@
         </div>
       </div>
 
+      <nav class="admin-tabs" role="tablist" aria-label="管理端功能">
+        <button class="admin-tab active" id="tab-overview" type="button" role="tab" aria-selected="true" aria-controls="panel-overview" data-tab="overview">概览</button>
+        <button class="admin-tab" id="tab-files" type="button" role="tab" aria-selected="false" aria-controls="panel-files" data-tab="files">共享文件</button>
+        <button class="admin-tab" id="tab-downloads" type="button" role="tab" aria-selected="false" aria-controls="panel-downloads" data-tab="downloads">下载记录</button>
+      </nav>
+
+      <section class="admin-panel active" id="panel-overview" role="tabpanel" aria-labelledby="tab-overview" data-panel="overview">
       <!-- Stats -->
       <div class="stat-grid">
         <div class="stat"><div class="stat-label">已配对设备</div><div class="stat-value" id="stat-devices">—</div><div class="stat-sub" id="stat-paired-sub">—</div></div>
@@ -97,7 +104,9 @@
           </div>
         </div>
       </div>
+      </section>
 
+      <section class="admin-panel" id="panel-files" role="tabpanel" aria-labelledby="tab-files" data-panel="files" hidden>
       <!-- Shared files -->
       <div class="card files-card">
         <div class="card-head">
@@ -120,6 +129,22 @@
           <div class="empty">加载中…</div>
         </div>
       </div>
+      </section>
+
+      <section class="admin-panel" id="panel-downloads" role="tabpanel" aria-labelledby="tab-downloads" data-panel="downloads" hidden>
+      <div class="card downloads-card">
+        <div class="card-head">
+          <span class="card-title">下载记录</span>
+          <div class="card-actions">
+            <input id="download-search" class="file-search compact-search" type="search" placeholder="搜索文件或设备" autocomplete="off" spellcheck="false">
+            <button id="clear-downloads-btn" class="btn btn-danger">清空记录</button>
+          </div>
+        </div>
+        <div id="downloads-body">
+          <div class="empty">加载中…</div>
+        </div>
+      </div>
+      </section>
     </div>
   </div>
 

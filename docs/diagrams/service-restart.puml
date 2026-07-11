@@ -1,0 +1,47 @@
+@startuml
+!theme plain
+
+title cloudsyncd service restart and verification
+
+start
+:Stop the old foreground process\nwith Ctrl+C;
+:Start the current checkout\ncloudsyncd server start;
+
+fork
+  :GET 127.0.0.1:21891/api/status;
+  if (client port returns 200?) then (yes)
+    :Receiver origin is ready;
+  else (no)
+    :Check the Node process and server log;
+    stop
+  endif
+fork again
+  :GET 127.0.0.1:21900/api/local/status;
+  if (admin port returns 200?) then (yes)
+    :Local admin is ready;
+  else (no)
+    :Check ADMIN_HOST and ADMIN_PORT;
+    stop
+  endif
+end fork
+
+if (Cloudflare Tunnel enabled?) then (yes)
+  :GET public hostname /api/status;
+  if (public endpoint returns 200?) then (yes)
+    :Tunnel and origin are ready;
+  else (no)
+    :Check cloudflared process and log;
+    stop
+  endif
+else (no)
+endif
+
+:Keep the Node process running\nor use a process manager;
+stop
+
+note right
+  A browser refresh can load changed static files,
+  but an old Node process keeps its old route table.
+end note
+
+@enduml

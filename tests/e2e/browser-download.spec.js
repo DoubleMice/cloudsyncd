@@ -6,7 +6,7 @@ const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 
-const ROOT = path.resolve(__dirname, '..');
+const ROOT = path.resolve(__dirname, '../..');
 const LARGE_FILE_BYTES = 33 * 1024 * 1024 + 123;
 const CLI_FILE_BYTES = 5 * 1024 * 1024 + 321;
 
@@ -240,7 +240,7 @@ function attachPageDiagnostics(page, testInfo) {
   });
 }
 
-async function startCloudsyncd({ port, adminPort, dataDir, sharedDir }) {
+async function startCloudsyncd({ port, adminPort, dataDir, sharedDir, waitForPin = true }) {
   const logs = [];
   let pinResolve;
   let pinReject;
@@ -278,10 +278,13 @@ async function startCloudsyncd({ port, adminPort, dataDir, sharedDir }) {
   });
 
   await waitForHttp(`http://127.0.0.1:${port}/api/status`);
-  const pin = await Promise.race([
-    pinPromise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error(`Timed out waiting for PIN:\n${logs.join('')}`)), 10000)),
-  ]);
+  if (!waitForPin) pinPromise.catch(() => {});
+  const pin = waitForPin
+    ? await Promise.race([
+      pinPromise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error(`Timed out waiting for PIN:\n${logs.join('')}`)), 10000)),
+    ])
+    : null;
 
   return {
     pin,
@@ -303,8 +306,8 @@ async function startFixture(files = {}, setup) {
   if (setup) await setup({ tmp, dataDir, sharedDir });
   const port = await freePort();
   const adminPort = await freePort();
-  const server = await startCloudsyncd({ port, adminPort, dataDir, sharedDir });
-  return {
+  let server = await startCloudsyncd({ port, adminPort, dataDir, sharedDir });
+  const fixture = {
     tmp,
     dataDir,
     sharedDir,
@@ -314,11 +317,18 @@ async function startFixture(files = {}, setup) {
     adminUrl: `http://127.0.0.1:${adminPort}`,
     pin: server.pin,
     logs: server.logs,
+    async restart() {
+      await server.stop();
+      server = await startCloudsyncd({ port, adminPort, dataDir, sharedDir, waitForPin: false });
+      if (server.pin) fixture.pin = server.pin;
+      fixture.logs = server.logs;
+    },
     async cleanup() {
       await server.stop();
       fs.rmSync(tmp, { recursive: true, force: true });
     },
   };
+  return fixture;
 }
 
 async function pairBrowser(page, fixture) {
@@ -353,6 +363,22 @@ test('CLI list/get uses a real server and streams chunked downloads', async () =
     expect(get.stdout).toContain(`Downloaded: ${out}`);
     expect(sha256File(out)).toBe(sha256File(path.join(fixture.sharedDir, 'large-cli.bin')));
     expect(fs.readdirSync(path.dirname(out)).filter((name) => name.includes('.cloudsyncd-'))).toEqual([]);
+
+    const historyResponse = await fetch(`${fixture.adminUrl}/api/local/downloads`);
+    expect(historyResponse.status).toBe(200);
+    const history = await historyResponse.json();
+    expect(history.entries).toHaveLength(1);
+    expect(history.entries[0]).toMatchObject({
+      type: 'file',
+      name: 'large-cli.bin',
+      size: CLI_FILE_BYTES,
+      status: 'completed',
+    });
+    expect(history.entries[0].deviceId).toMatch(/^client-/);
+
+    await fixture.restart();
+    const historyAfterRestart = await (await fetch(`${fixture.adminUrl}/api/local/downloads`)).json();
+    expect(historyAfterRestart.entries).toEqual(history.entries);
   } finally {
     await fixture.cleanup();
   }
@@ -380,6 +406,23 @@ test('browser receiver downloads a small unicode filename through the native dow
     await expect(fileRow.locator('.file-dl-label')).toHaveText('已完成');
     await expect(fileRow).toHaveClass(/download-complete/);
     await expect(page.locator('.toast.err')).toHaveCount(0);
+
+    await page.goto(`${fixture.adminUrl}/admin`, { waitUntil: 'domcontentloaded' });
+    await page.locator('#tab-downloads').click();
+    await expect(page.locator('#tab-downloads')).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('#downloads-body')).toContainText('目录/文件 空格.txt');
+    await expect(page.locator('#downloads-body')).toContainText('完成');
+    await expect(page.locator('#downloads-body')).toContainText('22 B');
+
+    await page.locator('#download-search').fill('不存在的设备');
+    await expect(page.locator('#downloads-body')).toContainText('没有匹配的下载记录');
+    await page.locator('#download-search').fill('文件 空格');
+    await expect(page.locator('#downloads-body')).toContainText('目录/文件 空格.txt');
+
+    page.once('dialog', (dialog) => dialog.accept());
+    await page.locator('#clear-downloads-btn').click();
+    await expect(page.locator('#downloads-body')).toContainText('暂无下载记录');
+    expect(JSON.parse(fs.readFileSync(path.join(fixture.dataDir, 'download-history.json'), 'utf8'))).toEqual([]);
   } finally {
     await fixture.cleanup();
   }
@@ -534,6 +577,12 @@ test('browser batch download writes a valid zip for selected files', async ({ pa
     expect(entries.get('a.txt').toString('utf8')).toBe('alpha\n');
     expect(entries.get('目录/b.txt').toString('utf8')).toBe('bravo\n');
     await expect(page.locator('.toast.err')).toHaveCount(0);
+
+    const historyResponse = await fetch(`${fixture.adminUrl}/api/local/downloads`);
+    const history = await historyResponse.json();
+    expect(history.entries).toHaveLength(2);
+    expect(history.entries.map((entry) => entry.name).sort()).toEqual(['a.txt', '目录/b.txt']);
+    expect(history.entries.every((entry) => entry.type === 'file' && entry.status === 'completed')).toBe(true);
   } finally {
     await fixture.cleanup();
   }
@@ -555,6 +604,8 @@ test('local admin can upload, search, and delete shared entries without deleting
     attachPageDiagnostics(page, testInfo);
     page.on('dialog', (dialog) => dialog.accept());
     await page.goto(`${fixture.adminUrl}/admin`, { waitUntil: 'domcontentloaded' });
+    await page.locator('#tab-files').click();
+    await expect(page.locator('#tab-files')).toHaveAttribute('aria-selected', 'true');
     await expect(page.locator('#files-body')).toContainText('linked-source.txt');
 
     await page.setInputFiles('#upload-input', uploadPath);
@@ -595,6 +646,63 @@ test('admin routes stay off the tunnel-facing listener while local admin remains
     expect(localAdmin.status).toBe(200);
     expect(localStatus.status).toBe(200);
     expect((await localStatus.json()).sharedFiles).toBe(1);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test('admin download tab explains that a stale server process must be restarted', async ({ page }) => {
+  const fixture = await startFixture();
+  try {
+    await page.route(`${fixture.adminUrl}/api/local/downloads`, (route) => route.fulfill({
+      status: 404,
+      contentType: 'text/html',
+      body: '<!DOCTYPE html><pre>Cannot GET /api/local/downloads</pre>',
+    }));
+    await page.goto(`${fixture.adminUrl}/admin`, { waitUntil: 'domcontentloaded' });
+    await page.locator('#tab-downloads').click();
+    await expect(page.locator('#downloads-body')).toContainText('请重启 cloudsyncd 服务后刷新页面');
+    await expect(page.locator('#downloads-body')).not.toContainText('<!DOCTYPE html>');
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test('download history is capped on load and clear persists a private empty history file', async () => {
+  const fixture = await startFixture({}, ({ dataDir }) => {
+    fs.mkdirSync(dataDir, { recursive: true });
+    const entries = Array.from({ length: 505 }, (_, index) => ({
+      id: `history-${index}`,
+      deviceId: 'seed-device',
+      type: 'file',
+      name: `file-${index}.bin`,
+      size: index,
+      startedAt: '2026-07-11T00:00:00.000Z',
+      completedAt: '2026-07-11T00:00:01.000Z',
+      durationMs: 1000,
+      status: 'completed',
+    }));
+    fs.writeFileSync(path.join(dataDir, 'download-history.json'), JSON.stringify(entries));
+  });
+
+  try {
+    const response = await fetch(`${fixture.adminUrl}/api/local/downloads`);
+    expect(response.status).toBe(200);
+    const history = await response.json();
+    expect(history.entries).toHaveLength(500);
+    expect(history.entries[0].id).toBe('history-0');
+    expect(history.entries[499].id).toBe('history-499');
+
+    const clearResponse = await fetch(`${fixture.adminUrl}/api/local/downloads`, { method: 'DELETE' });
+    expect(clearResponse.status).toBe(200);
+    expect(await clearResponse.json()).toEqual({ success: true, cleared: 500 });
+
+    await fixture.restart();
+    const emptyHistory = await (await fetch(`${fixture.adminUrl}/api/local/downloads`)).json();
+    expect(emptyHistory.entries).toEqual([]);
+    const historyPath = path.join(fixture.dataDir, 'download-history.json');
+    expect(JSON.parse(fs.readFileSync(historyPath, 'utf8'))).toEqual([]);
+    expect(fs.statSync(historyPath).mode & 0o777).toBe(0o600);
   } finally {
     await fixture.cleanup();
   }

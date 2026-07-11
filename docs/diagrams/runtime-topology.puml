@@ -16,11 +16,12 @@ node "Host machine" as Host {
     component "admin Express app\n127.0.0.1:21900" as AdminApp
   }
 
-  folder "public/" as PublicDir
-  folder "admin/" as AdminDir
+  folder "public/\nreceiver web UI" as PublicDir
+  folder "admin/\nlocal admin UI" as AdminDir
   folder "shared/" as SharedDir
   database "data/state.json\nmasterKey, devices,\nadminToken" as State
   artifact "data/.admin-token" as TokenFile
+  database "data/download-history.json\nlatest 500 transfer results\nmode 0600" as DownloadHistory
 }
 
 Browser --> Edge : HTTPS UI and API
@@ -30,28 +31,32 @@ Tunnel --> ClientApp : HTTP loopback\n/api/* and static UI
 ClientApp --> PublicDir : serves index.html and app.js
 ClientApp --> SharedDir : list files and stream downloads
 ClientApp --> State : masterKey and device list
+ClientApp --> DownloadHistory : append completed or failed\nencrypted stream result
 
 Operator --> AdminApp : local browser or SSH port forward
 AdminApp --> AdminDir : serves admin UI
 AdminApp --> State : device/key/token operations
 AdminApp --> SharedDir : status and file listing
 AdminApp --> TokenFile : local token copy
+AdminApp --> DownloadHistory : GET search/list\nDELETE clear
 
 note bottom of AdminApp
   The tunnel forwards only 21891.
   /admin and /api/local/* stay local-only.
+  Views: overview, shared files,
+  and download history.
+  Both listeners stop with the Node process.
+end note
+
+note bottom of DownloadHistory
+  "completed" means the server pipeline ended.
+  It is not an end-to-end decrypt/save receipt.
 end note
 
 note bottom of ClientApp
   Public routes use security headers,
   per-request HMAC, timestamp window,
   and nonce replay protection.
-end note
-
-note bottom of Tunnel
-  A registered tunnel is not enough.
-  If 127.0.0.1:21891 is down,
-  Cloudflare returns 502.
 end note
 
 @enduml

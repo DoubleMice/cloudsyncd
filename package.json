@@ -2,6 +2,14 @@
   "name": "cloudsyncd",
   "version": "1.0.0",
   "description": "Encrypted file sync and share service with PIN pairing and Cloudflare Tunnel support.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DoubleMice/cloudsyncd.git"
+  },
+  "bugs": {
+    "url": "https://github.com/DoubleMice/cloudsyncd/issues"
+  },
+  "homepage": "https://github.com/DoubleMice/cloudsyncd#readme",
   "main": "server.js",
   "bin": {
     "cloudsyncd": "bin/cloudsyncd.js"
@@ -15,21 +23,26 @@
   "files": [
     "admin/",
     "bin/",
-    "cloudflared-config.example.yml",
-    "devices.js",
+    "config/",
     "docs/",
     "lib/",
-    "pin.js",
     "public/",
+    "scripts/",
     "server.js",
-    "share.js",
-    "start.sh",
-    "OPEN_SOURCE_AUDIT.md"
+    "README.md"
   ],
-  "keywords": [],
+  "keywords": [
+    "cloudflare-tunnel",
+    "encryption",
+    "file-sharing",
+    "self-hosted"
+  ],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "express": "^5.2.1",
     "tar": "^7.5.16"

@@ -27,6 +27,9 @@ cloudflared-config.yml
 cloudflared-config.local.yml
 cloudflared-credentials*.json
 /????????-????-????-????-????????????.json
+config/*.local.yml
+config/*.local.yaml
+config/*credentials*.json
 *.cfargotunnel.com
 cloudflared*.log
 
@@ -39,6 +42,7 @@ coverage/
 .nyc_output/
 test-results/
 playwright-report/
+*.tgz
 
 # Python/local tooling
 __pycache__/

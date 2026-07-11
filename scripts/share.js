@@ -5,20 +5,21 @@
 
 const fs = require('fs');
 const path = require('path');
-const { formatSize } = require('./lib/format');
+const ROOT = path.resolve(__dirname, '..');
+const { formatSize } = require('../lib/format');
 
 const sharedDir = process.env.CLOUDSYNCD_SHARED_DIR
   ? path.resolve(process.env.CLOUDSYNCD_SHARED_DIR)
-  : path.join(__dirname, 'shared');
+  : path.join(ROOT, 'shared');
 const args = process.argv.slice(2);
 const forceCopy = args.includes('--copy');
 
 if (args.length === 0 || (args.length === 1 && forceCopy)) {
   console.log('用法:');
-  console.log('  node share.js file1.pdf dir/ file2.txt  — 加入 shared/（默认硬链接，省空间）');
-  console.log('  node share.js --copy file.pdf           — 强制复制一份（旧行为）');
-  console.log('  node share.js --list                    — 列出共享文件');
-  console.log('  node share.js --clear                   — 清空 shared/');
+  console.log('  cloudsyncd share file1.pdf dir/ file2.txt  — 加入 shared/（默认硬链接，省空间）');
+  console.log('  cloudsyncd share --copy file.pdf           — 强制复制');
+  console.log('  cloudsyncd share list                       — 列出共享文件');
+  console.log('  cloudsyncd share clear                      — 清空 shared/');
   process.exit(0);
 }
 

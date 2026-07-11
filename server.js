@@ -66,6 +66,8 @@ const DATA_DIR = process.env.CLOUDSYNCD_DATA_DIR
   : path.join(__dirname, 'data');
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
 const ADMIN_TOKEN_FILE = path.join(DATA_DIR, '.admin-token');
+const DOWNLOAD_HISTORY_FILE = path.join(DATA_DIR, 'download-history.json');
+const MAX_DOWNLOAD_HISTORY = 500;
 const PRIVATE_DIR_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const sharedDir = process.env.CLOUDSYNCD_SHARED_DIR
@@ -171,6 +173,52 @@ function writePrivateFile(filePath, data) {
 ensurePrivateDataDir();
 ensurePrivateFile(STATE_FILE);
 ensurePrivateFile(ADMIN_TOKEN_FILE);
+ensurePrivateFile(DOWNLOAD_HISTORY_FILE);
+
+function loadDownloadHistory() {
+  try {
+    if (!fs.existsSync(DOWNLOAD_HISTORY_FILE)) return [];
+    const parsed = JSON.parse(fs.readFileSync(DOWNLOAD_HISTORY_FILE, 'utf8'));
+    return Array.isArray(parsed) ? parsed.slice(0, MAX_DOWNLOAD_HISTORY) : [];
+  } catch (err) {
+    console.error('[DOWNLOAD] Failed to load history:', err.message);
+    return [];
+  }
+}
+
+let downloadHistory = loadDownloadHistory();
+
+function saveDownloadHistory() {
+  writePrivateFile(DOWNLOAD_HISTORY_FILE, `${JSON.stringify(downloadHistory, null, 2)}\n`);
+}
+
+function beginDownloadRecord({ deviceId, type, name, size, fileCount }) {
+  const record = {
+    id: crypto.randomUUID(),
+    deviceId,
+    type,
+    name,
+    size,
+    ...(fileCount == null ? {} : { fileCount }),
+    startedAt: new Date().toISOString(),
+  };
+  return (err) => {
+    const completedAt = new Date().toISOString();
+    downloadHistory.unshift({
+      ...record,
+      completedAt,
+      durationMs: Math.max(0, new Date(completedAt).getTime() - new Date(record.startedAt).getTime()),
+      status: err ? 'failed' : 'completed',
+      ...(err ? { error: String(err.message || err).slice(0, 300) } : {}),
+    });
+    downloadHistory = downloadHistory.slice(0, MAX_DOWNLOAD_HISTORY);
+    try {
+      saveDownloadHistory();
+    } catch (saveErr) {
+      console.error('[DOWNLOAD] Failed to save history:', saveErr.message);
+    }
+  };
+}
 
 function loadState() {
   try {
@@ -716,6 +764,17 @@ adminApp.get('/api/local/files', requireAdminToken, (req, res) => {
   res.json({ entries: walkDir(sharedDir) });
 });
 
+adminApp.get('/api/local/downloads', requireAdminToken, (req, res) => {
+  res.json({ entries: downloadHistory });
+});
+
+adminApp.delete('/api/local/downloads', requireAdminToken, (req, res) => {
+  const cleared = downloadHistory.length;
+  downloadHistory = [];
+  saveDownloadHistory();
+  res.json({ success: true, cleared });
+});
+
 adminApp.post('/api/local/files/clear', requireAdminToken, (req, res) => {
   fs.rmSync(sharedDir, { recursive: true, force: true });
   fs.mkdirSync(sharedDir, { recursive: true });
@@ -875,9 +934,19 @@ function sharedFileHeaders(relPath, fileSize) {
   };
 }
 
-function sendSharedFileDownload({ res, file, relPath, chunked }) {
+function sendSharedFileDownload({ req, res, file, relPath, chunked }) {
   const fileSize = file.stat.size;
   withDownloadSlot(res, (releaseSlot) => {
+    const recordDownload = beginDownloadRecord({
+      deviceId: req.authenticatedDeviceId,
+      type: 'file',
+      name: relPath,
+      size: fileSize,
+    });
+    const onComplete = (err) => {
+      releaseSlot();
+      recordDownload(err);
+    };
     if (chunked) {
       streamChunkedEncryptedResponse({
         res,
@@ -886,7 +955,7 @@ function sendSharedFileDownload({ res, file, relPath, chunked }) {
         relPath,
         label: 'FILE-CHUNKED',
         extraHeaders: sharedFileHeaders(relPath, fileSize),
-        onComplete: releaseSlot,
+        onComplete,
       });
       return;
     }
@@ -899,7 +968,7 @@ function sendSharedFileDownload({ res, file, relPath, chunked }) {
         'Content-Length': String(fileSize + 16),
         ...sharedFileHeaders(relPath, fileSize),
       },
-      onComplete: releaseSlot,
+      onComplete,
     });
   });
 }
@@ -908,14 +977,14 @@ app.get(/^\/api\/files-chunked\/(.*)/, requireDeviceAuth, (req, res) => {
   const relPath = req.params[0] || '';
   const file = resolveSharedFile(relPath, res);
   if (!file) return;
-  sendSharedFileDownload({ res, file, relPath: file.rel, chunked: true });
+  sendSharedFileDownload({ req, res, file, relPath: file.rel, chunked: true });
 });
 
 app.get(/^\/api\/files\/(.*)/, requireDeviceAuth, (req, res) => {
   const relPath = req.params[0] || '';
   const file = resolveSharedFile(relPath, res);
   if (!file) return;
-  sendSharedFileDownload({ res, file, relPath: file.rel, chunked: false });
+  sendSharedFileDownload({ req, res, file, relPath: file.rel, chunked: false });
 });
 
 // ============ Batch Download ============
@@ -939,6 +1008,13 @@ app.get('/api/batch', requireDeviceAuth, (req, res) => {
   }
 
   withDownloadSlot(res, (releaseSlot) => {
+    const recordDownload = beginDownloadRecord({
+      deviceId: req.authenticatedDeviceId,
+      type: 'batch',
+      name: 'cloudsyncd-files.tar.gz',
+      size: totalSize,
+      fileCount: files.length,
+    });
     streamEncryptedResponse({
       res,
       sourceStream: tar.create({ gzip: true, cwd: sharedDir }, files),
@@ -947,7 +1023,10 @@ app.get('/api/batch', requireDeviceAuth, (req, res) => {
         'X-Batch-Count': String(files.length),
         'X-Batch-Total-Size': String(totalSize),
       },
-      onComplete: releaseSlot,
+      onComplete: (err) => {
+        releaseSlot();
+        recordDownload(err);
+      },
     });
   });
 });
@@ -1009,8 +1088,8 @@ app.listen(PORT, HOST, () => {
   if (devices.length === 0) {
     createPairSession();
   } else {
-    console.log('\nReady. Run `node pin.js` to generate a PIN for a new device.');
-    console.log('Run `node devices.js` to list or revoke paired devices.\n');
+    console.log('\nReady. Run `cloudsyncd server pin` to generate a PIN for a new device.');
+    console.log('Run `cloudsyncd server devices` to list or revoke paired devices.\n');
   }
 });
 

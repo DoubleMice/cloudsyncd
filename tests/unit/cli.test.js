@@ -8,8 +8,8 @@ const path = require('path');
 const { Readable } = require('stream');
 const test = require('node:test');
 
-const client = require('../lib/client');
-const profiles = require('../lib/client-profiles');
+const client = require('../../lib/client');
+const profiles = require('../../lib/client-profiles');
 const {
   cloudflaredRouteDnsArgs,
   cloudflaredRunArgs,
@@ -23,14 +23,14 @@ const {
   resolveTunnelPidFile,
   stopTunnel,
   usage,
-} = require('../lib/cli');
+} = require('../../lib/cli');
 const {
   CHUNKED_ENCRYPTION_MODE,
   createChunkedDecryptStream,
   createChunkedEncryptStream,
   decryptChunkedFrames,
   encryptedChunkedContentLength,
-} = require('../lib/chunked-encryption');
+} = require('../../lib/chunked-encryption');
 const {
   buildRequestSignatureMessage,
   decryptEnvelope,
@@ -39,7 +39,9 @@ const {
   encryptEnvelope,
   hmac,
   hkdf,
-} = require('../lib/protocol');
+} = require('../../lib/protocol');
+
+const ROOT = path.resolve(__dirname, '../..');
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -340,8 +342,8 @@ test('share add skips files already present in shared without deleting them', ()
   fs.mkdirSync(alreadySharedDir);
   fs.writeFileSync(path.join(alreadySharedDir, 'child.txt'), 'child');
 
-  const result = spawnSync(process.execPath, [path.join(__dirname, '..', 'share.js'), alreadyShared], {
-    cwd: path.join(__dirname, '..'),
+  const result = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'share.js'), alreadyShared], {
+    cwd: ROOT,
     env: { ...process.env, CLOUDSYNCD_SHARED_DIR: shared },
     encoding: 'utf8',
   });
@@ -351,8 +353,8 @@ test('share add skips files already present in shared without deleting them', ()
   assert.match(result.stdout, /\[same\]/);
   assert.match(result.stdout, /已存在 1/);
 
-  const dirResult = spawnSync(process.execPath, [path.join(__dirname, '..', 'share.js'), alreadySharedDir], {
-    cwd: path.join(__dirname, '..'),
+  const dirResult = spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'share.js'), alreadySharedDir], {
+    cwd: ROOT,
     env: { ...process.env, CLOUDSYNCD_SHARED_DIR: shared },
     encoding: 'utf8',
   });
@@ -480,7 +482,7 @@ test('tunnel setup reads tunnel and hostname from config file', () => {
 test('tunnel setup rejects placeholder config values', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cloudsyncd-tunnel-placeholder-'));
   const config = path.join(dir, 'cloudflared-config.yml');
-  fs.writeFileSync(config, fs.readFileSync(path.join(__dirname, '..', 'cloudflared-config.example.yml'), 'utf8'));
+  fs.writeFileSync(config, fs.readFileSync(path.join(ROOT, 'config', 'cloudflared.example.yml'), 'utf8'));
 
   assert.throws(
     () => cloudflaredSetupPlan({ config }),
@@ -517,7 +519,7 @@ test('receive alias routes to client logout', async () => {
 test('protocol helpers encode remote paths and sign request messages', () => {
   assert.strictEqual(encodeRemotePath('/目录/文件 空格.txt'), '%E7%9B%AE%E5%BD%95/%E6%96%87%E4%BB%B6%20%E7%A9%BA%E6%A0%BC.txt');
   const key = Buffer.alloc(32, 7);
-  const headers = require('../lib/protocol').signRequest({
+  const headers = require('../../lib/protocol').signRequest({
     masterKey: key,
     deviceId: 'client-test',
     method: 'GET',
@@ -606,11 +608,11 @@ test('chunked encryption frames decrypt after fixed-size stream chunking', async
 });
 
 test('browser large downloads avoid unsafe blob fallback paths', () => {
-  const source = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
+  const source = fs.readFileSync(path.join(ROOT, 'public', 'app.js'), 'utf8');
   const openChunked = extractFunctionSource(source, 'openChunkedDownloadSink');
   const openZip = extractFunctionSource(source, 'openZipSink');
   const collectFileBytes = extractFunctionSource(source, 'collectFileBytes');
-  const serviceWorker = fs.readFileSync(path.join(__dirname, '..', 'public', 'download-sw.js'), 'utf8');
+  const serviceWorker = fs.readFileSync(path.join(ROOT, 'public', 'download-sw.js'), 'utf8');
 
   assert.doesNotMatch(openChunked, /return null/);
   assert.match(openChunked, /openWorkerManagedChunkedDownload/);

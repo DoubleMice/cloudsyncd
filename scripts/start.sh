@@ -2,15 +2,16 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PORT="${PORT:-21891}"
-TUNNEL_CONFIG="${TUNNEL_CONFIG:-$SCRIPT_DIR/cloudflared-config.yml}"
+TUNNEL_CONFIG="${TUNNEL_CONFIG:-$ROOT_DIR/cloudflared-config.yml}"
 TUNNEL_PIDFILE="${TUNNEL_PIDFILE:-/tmp/cloudflared-sync.pid}"
 TUNNEL_LOGFILE="${TUNNEL_LOGFILE:-/tmp/cloudflared-sync.log}"
 
 echo "Starting cloudsyncd on port ${PORT}..."
 
 # Compatibility path. Prefer: cloudsyncd server start --tunnel
-# Run as: WITH_TUNNEL=1 ./start.sh   (tunnel runs in the background, logs to /tmp/cloudflared-sync.log)
+# Run as: WITH_TUNNEL=1 ./scripts/start.sh
 if [ "${WITH_TUNNEL:-0}" = "1" ]; then
   if ! command -v cloudflared >/dev/null 2>&1; then
     echo "WITH_TUNNEL=1 but cloudflared is not installed; skipping tunnel." >&2
@@ -28,5 +29,5 @@ if [ "${WITH_TUNNEL:-0}" = "1" ]; then
   fi
 fi
 
-cd "$SCRIPT_DIR"
-node "$SCRIPT_DIR/server.js"
+cd "$ROOT_DIR"
+node "$ROOT_DIR/server.js"
